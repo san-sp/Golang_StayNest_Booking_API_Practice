@@ -1,0 +1,5 @@
+ALTER TABLE hotels
+ADD COLUMN timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Kolkata';
+
+ALTER TABLE hotels
+ALTER COLUMN timezone DROP DEFAULT;

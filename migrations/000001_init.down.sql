@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS room_inventory;
+DROP TABLE IF EXISTS room_types;
+DROP TABLE IF EXISTS hotels;
+DROP TABLE IF EXISTS customers;
