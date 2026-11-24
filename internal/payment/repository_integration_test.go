@@ -360,6 +360,84 @@ func createPaymentForLeaseTest(
 	return payment
 }
 
+func createPendingRefundForClaimTest(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	payment *Payment,
+	nextAttemptAt time.Time,
+) string {
+	t.Helper()
+
+	var refundID string
+
+	providerPaymentID := fmt.Sprintf(
+		"pay_test_%s",
+		strings.ReplaceAll(payment.ID, "-", ""),
+	)
+
+	err := pool.QueryRow(context.Background(), `
+		INSERT INTO payment_refunds (
+			payment_id,
+			provider,
+			provider_payment_id,
+			idempotency_key,
+			amount_paise,
+			currency,
+			status,
+			next_attempt_at
+		)
+		VALUES ($1, 'razorpay', $2, $3, $4, $5, 'pending', $6)
+		RETURNING id::text
+	`,
+		payment.ID,
+		providerPaymentID,
+		"refund-"+payment.ID,
+		payment.AmountPaise,
+		payment.Currency,
+		nextAttemptAt,
+	).Scan(&refundID)
+
+	if err != nil {
+		t.Fatalf("failed to create pending refund: %v", err)
+	}
+
+	return refundID
+}
+
+func setRefundProcessingLeaseForClaimTest(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	refundID string,
+	providerRefundID string,
+	leaseExpiresAt time.Time,
+) string {
+	t.Helper()
+
+	var leaseToken string
+
+	err := pool.QueryRow(context.Background(), `
+		UPDATE payment_refunds
+		SET
+			status = 'processing',
+			provider_refund_id = $2,
+			processing_lease_token = gen_random_uuid(),
+			processing_lease_expires_at = $3,
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING processing_lease_token::text
+	`,
+		refundID,
+		providerRefundID,
+		leaseExpiresAt,
+	).Scan(&leaseToken)
+
+	if err != nil {
+		t.Fatalf("failed to set refund processing lease: %v", err)
+	}
+
+	return leaseToken
+}
+
 func TestRepositoryCreatePending(t *testing.T) {
 	repo, pool := setupPaymentRepository(t)
 	fixture := createPaymentTestFixture(t, pool)
@@ -1947,5 +2025,1550 @@ func TestRepositoryFulfillCapturedPaymentConcurrently(t *testing.T) {
 
 	if refundCount != 0 {
 		t.Fatalf("expected no refunds, got %d", refundCount)
+	}
+}
+
+func TestRepositoryClaimPendingRefunds(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	now := time.Now().UTC()
+
+	payment1 := createPaymentForLeaseTest(t, repo, fixture)
+	payment2 := createPaymentForLeaseTest(t, repo, fixture)
+	payment3 := createPaymentForLeaseTest(t, repo, fixture)
+
+	refund1 := createPendingRefundForClaimTest(
+		t, pool, payment1, now.Add(-time.Minute),
+	)
+	refund2 := createPendingRefundForClaimTest(
+		t, pool, payment2, now.Add(-time.Minute),
+	)
+	futureRefund := createPendingRefundForClaimTest(
+		t, pool, payment3, now.Add(time.Hour),
+	)
+
+	claimed, err := repo.ClaimPendingRefunds(
+		context.Background(),
+		10,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("ClaimPendingRefunds() error = %v", err)
+	}
+
+	if len(claimed) != 2 {
+		t.Fatalf("expected 2 claimed refunds, got %d", len(claimed))
+	}
+
+	claimedIDs := make(map[string]bool)
+
+	for _, refund := range claimed {
+		claimedIDs[refund.ID] = true
+
+		if refund.Status != "processing" {
+			t.Errorf(
+				"expected status processing, got %q",
+				refund.Status,
+			)
+		}
+
+		if refund.AttemptCount != 1 {
+			t.Errorf(
+				"expected attempt count 1, got %d",
+				refund.AttemptCount,
+			)
+		}
+
+		if refund.ProcessingLeaseToken == nil ||
+			*refund.ProcessingLeaseToken == "" {
+			t.Error("expected processing lease token")
+		}
+
+		if refund.ProcessingLeaseExpiresAt == nil {
+			t.Error("expected processing lease expiration")
+		} else if !refund.ProcessingLeaseExpiresAt.After(time.Now()) {
+			t.Error("expected lease expiration to be in the future")
+		}
+	}
+
+	if !claimedIDs[refund1] {
+		t.Errorf("expected refund %s to be claimed", refund1)
+	}
+
+	if !claimedIDs[refund2] {
+		t.Errorf("expected refund %s to be claimed", refund2)
+	}
+
+	if claimedIDs[futureRefund] {
+		t.Errorf("future refund %s should not have been claimed", futureRefund)
+	}
+
+	var futureStatus string
+
+	err = pool.QueryRow(
+		context.Background(),
+		`SELECT status FROM payment_refunds WHERE id = $1`,
+		futureRefund,
+	).Scan(&futureStatus)
+
+	if err != nil {
+		t.Fatalf("failed to read future refund status: %v", err)
+	}
+
+	if futureStatus != "pending" {
+		t.Errorf(
+			"expected future refund to remain pending, got %q",
+			futureStatus,
+		)
+	}
+}
+
+func TestRepositoryClaimPendingRefundsConcurrent(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	const workerCount = 5
+
+	for i := 0; i < workerCount; i++ {
+		payment := createPaymentForLeaseTest(t, repo, fixture)
+
+		createPendingRefundForClaimTest(
+			t,
+			pool,
+			payment,
+			time.Now().UTC().Add(-time.Minute),
+		)
+	}
+
+	claimedCh := make(chan Refund, workerCount)
+	errCh := make(chan error, workerCount)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			refunds, err := repo.ClaimPendingRefunds(
+				context.Background(),
+				1,
+				5*time.Minute,
+			)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			for _, refund := range refunds {
+				claimedCh <- refund
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(claimedCh)
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent ClaimPendingRefunds() error: %v", err)
+	}
+
+	claimedIDs := make(map[string]bool)
+
+	for refund := range claimedCh {
+		if claimedIDs[refund.ID] {
+			t.Errorf("refund %s was claimed more than once", refund.ID)
+		}
+
+		claimedIDs[refund.ID] = true
+	}
+
+	if len(claimedIDs) != workerCount {
+		t.Errorf(
+			"expected %d uniquely claimed refunds, got %d",
+			workerCount,
+			len(claimedIDs),
+		)
+	}
+}
+
+func TestRepositoryClaimPendingRefundsValidation(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	_, err := repo.ClaimPendingRefunds(
+		ctx,
+		0,
+		time.Minute,
+	)
+	if !errors.Is(err, ErrInvalidRefundClaimBatchSize) {
+		t.Errorf(
+			"expected ErrInvalidRefundClaimBatchSize, got %v",
+			err,
+		)
+	}
+
+	_, err = repo.ClaimPendingRefunds(
+		ctx,
+		1,
+		0,
+	)
+	if !errors.Is(err, ErrInvalidRefundLeaseDuration) {
+		t.Errorf(
+			"expected ErrInvalidRefundLeaseDuration, got %v",
+			err,
+		)
+	}
+}
+
+func TestRepositoryClaimExpiredRefunds(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	now := time.Now().UTC()
+
+	// Create an expired processing refund.
+	expiredPayment := createPaymentForLeaseTest(t, repo, fixture)
+	expiredRefundID := createPendingRefundForClaimTest(
+		t, pool, expiredPayment, now.Add(-time.Minute),
+	)
+
+	providerRefundID := "rfnd_test_" +
+		strings.ReplaceAll(expiredPayment.ID, "-", "")
+
+	originalToken := setRefundProcessingLeaseForClaimTest(
+		t,
+		pool,
+		expiredRefundID,
+		providerRefundID,
+		now.Add(-time.Minute),
+	)
+
+	// Create an active processing refund.
+	activePayment := createPaymentForLeaseTest(t, repo, fixture)
+	activeRefundID := createPendingRefundForClaimTest(
+		t, pool, activePayment, now.Add(-time.Minute),
+	)
+
+	activeProviderRefundID := "rfnd_active_" +
+		strings.ReplaceAll(activePayment.ID, "-", "")
+
+	activeToken := setRefundProcessingLeaseForClaimTest(
+		t,
+		pool,
+		activeRefundID,
+		activeProviderRefundID,
+		now.Add(time.Hour),
+	)
+
+	// Create an eligible pending refund. It must not be claimed here.
+	pendingPayment := createPaymentForLeaseTest(t, repo, fixture)
+	pendingRefundID := createPendingRefundForClaimTest(
+		t, pool, pendingPayment, now.Add(-time.Minute),
+	)
+
+	claimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		10,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("ClaimExpiredRefunds() error = %v", err)
+	}
+
+	if len(claimed) != 1 {
+		t.Fatalf("expected 1 reclaimed refund, got %d", len(claimed))
+	}
+
+	refund := claimed[0]
+
+	if refund.ID != expiredRefundID {
+		t.Errorf(
+			"expected refund %s, got %s",
+			expiredRefundID,
+			refund.ID,
+		)
+	}
+
+	if refund.Status != "processing" {
+		t.Errorf("expected processing status, got %q", refund.Status)
+	}
+
+	if refund.AttemptCount != 1 {
+		t.Errorf("expected attempt count 1, got %d", refund.AttemptCount)
+	}
+
+	if refund.ProcessingLeaseToken == nil {
+		t.Fatal("expected new processing lease token")
+	}
+
+	if *refund.ProcessingLeaseToken == originalToken {
+		t.Error("expected a new lease token after reclaiming")
+	}
+
+	if refund.ProcessingLeaseExpiresAt == nil {
+		t.Fatal("expected processing lease expiration")
+	}
+
+	if !refund.ProcessingLeaseExpiresAt.After(time.Now()) {
+		t.Error("expected new lease expiration to be in the future")
+	}
+
+	if refund.ProviderRefundID == nil ||
+		*refund.ProviderRefundID != providerRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %v",
+			providerRefundID,
+			refund.ProviderRefundID,
+		)
+	}
+
+	if refund.IdempotencyKey != "refund-"+expiredPayment.ID {
+		t.Errorf(
+			"original idempotency key changed: %q",
+			refund.IdempotencyKey,
+		)
+	}
+
+	// Verify the active lease was not reclaimed.
+	var storedActiveToken string
+	var activeAttemptCount int
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			processing_lease_token::text,
+			attempt_count
+		FROM payment_refunds
+		WHERE id = $1
+	`, activeRefundID).Scan(
+		&storedActiveToken,
+		&activeAttemptCount,
+	)
+	if err != nil {
+		t.Fatalf("failed to read active refund: %v", err)
+	}
+
+	if storedActiveToken != activeToken {
+		t.Error("active refund lease token should not change")
+	}
+
+	if activeAttemptCount != 0 {
+		t.Errorf(
+			"expected active refund attempt count 0, got %d",
+			activeAttemptCount,
+		)
+	}
+
+	// Verify the pending refund was not reclaimed.
+	var pendingStatus string
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT status
+		FROM payment_refunds
+		WHERE id = $1
+	`, pendingRefundID).Scan(&pendingStatus)
+	if err != nil {
+		t.Fatalf("failed to read pending refund: %v", err)
+	}
+
+	if pendingStatus != "pending" {
+		t.Errorf(
+			"expected pending refund to remain pending, got %q",
+			pendingStatus,
+		)
+	}
+}
+
+func TestRepositoryClaimExpiredRefundsConcurrent(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	const workerCount = 5
+
+	for i := 0; i < workerCount; i++ {
+		payment := createPaymentForLeaseTest(t, repo, fixture)
+
+		refundID := createPendingRefundForClaimTest(
+			t,
+			pool,
+			payment,
+			time.Now().UTC().Add(-time.Minute),
+		)
+
+		providerRefundID := "rfnd_concurrent_" +
+			strings.ReplaceAll(payment.ID, "-", "")
+
+		setRefundProcessingLeaseForClaimTest(
+			t,
+			pool,
+			refundID,
+			providerRefundID,
+			time.Now().UTC().Add(-time.Minute),
+		)
+	}
+
+	claimedCh := make(chan Refund, workerCount)
+	errCh := make(chan error, workerCount)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			refunds, err := repo.ClaimExpiredRefunds(
+				context.Background(),
+				1,
+				5*time.Minute,
+			)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			for _, refund := range refunds {
+				claimedCh <- refund
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(claimedCh)
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent ClaimExpiredRefunds() error: %v", err)
+	}
+
+	claimedIDs := make(map[string]bool)
+
+	for refund := range claimedCh {
+		if claimedIDs[refund.ID] {
+			t.Errorf("refund %s was reclaimed more than once", refund.ID)
+		}
+
+		claimedIDs[refund.ID] = true
+	}
+
+	if len(claimedIDs) != workerCount {
+		t.Errorf(
+			"expected %d uniquely reclaimed refunds, got %d",
+			workerCount,
+			len(claimedIDs),
+		)
+	}
+}
+
+func createClaimedRefundForTest(
+	t *testing.T,
+	repo *Repository,
+	pool *pgxpool.Pool,
+	fixture *paymentTestFixture,
+) (Refund, string) {
+	t.Helper()
+
+	payment := createPaymentForLeaseTest(t, repo, fixture)
+
+	refundID := createPendingRefundForClaimTest(
+		t,
+		pool,
+		payment,
+		time.Now().UTC().Add(-time.Minute),
+	)
+
+	claimed, err := repo.ClaimPendingRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("failed to claim test refund: %v", err)
+	}
+
+	if len(claimed) != 1 {
+		t.Fatalf("expected 1 claimed refund, got %d", len(claimed))
+	}
+
+	if claimed[0].ID != refundID {
+		t.Fatalf(
+			"expected claimed refund %s, got %s",
+			refundID,
+			claimed[0].ID,
+		)
+	}
+
+	if claimed[0].ProcessingLeaseToken == nil {
+		t.Fatal("expected processing lease token")
+	}
+
+	return claimed[0], *claimed[0].ProcessingLeaseToken
+}
+
+func TestRepositoryMarkRefundSucceeded(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t,
+		repo,
+		pool,
+		fixture,
+	)
+
+	providerRefundID := "rfnd_success_test_001"
+
+	err := repo.MarkRefundSucceeded(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		providerRefundID,
+	)
+	if err != nil {
+		t.Fatalf("MarkRefundSucceeded() error = %v", err)
+	}
+
+	var (
+		status                   string
+		storedProviderRefundID   *string
+		processingLeaseToken     *string
+		processingLeaseExpiresAt *time.Time
+		lastError                *string
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			status,
+			provider_refund_id,
+			processing_lease_token,
+			processing_lease_expires_at,
+			last_error
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&storedProviderRefundID,
+		&processingLeaseToken,
+		&processingLeaseExpiresAt,
+		&lastError,
+	)
+	if err != nil {
+		t.Fatalf("failed to read updated refund: %v", err)
+	}
+
+	if status != RefundStatusSucceeded {
+		t.Errorf("expected status succeeded, got %q", status)
+	}
+
+	if storedProviderRefundID == nil ||
+		*storedProviderRefundID != providerRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %v",
+			providerRefundID,
+			storedProviderRefundID,
+		)
+	}
+
+	if processingLeaseToken != nil {
+		t.Error("expected processing lease token to be cleared")
+	}
+
+	if processingLeaseExpiresAt != nil {
+		t.Error("expected processing lease expiration to be cleared")
+	}
+
+	if lastError != nil {
+		t.Errorf("expected last error to be cleared, got %q", *lastError)
+	}
+}
+
+func TestRepositoryMarkRefundSucceededWithExpiredLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t,
+		repo,
+		pool,
+		fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at = NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire refund lease: %v", err)
+	}
+
+	err = repo.MarkRefundSucceeded(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"rfnd_expired_test_001",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf(
+			"expected ErrRefundLeaseLost, got %v",
+			err,
+		)
+	}
+
+	var status string
+
+	err = pool.QueryRow(
+		context.Background(),
+		`SELECT status FROM payment_refunds WHERE id = $1`,
+		refund.ID,
+	).Scan(&status)
+	if err != nil {
+		t.Fatalf("failed to read refund status: %v", err)
+	}
+
+	if status != RefundStatusProcessing {
+		t.Errorf(
+			"expected status processing, got %q",
+			status,
+		)
+	}
+}
+
+func TestRepositoryMarkRefundSucceededWithStaleLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, workerAToken := createClaimedRefundForTest(
+		t,
+		repo,
+		pool,
+		fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at = NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire worker A lease: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("worker B failed to reclaim refund: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected worker B to reclaim 1 refund, got %d", len(reclaimed))
+	}
+
+	if reclaimed[0].ProcessingLeaseToken == nil {
+		t.Fatal("expected worker B lease token")
+	}
+
+	workerBToken := *reclaimed[0].ProcessingLeaseToken
+
+	if workerAToken == workerBToken {
+		t.Fatal("expected worker B to receive a different lease token")
+	}
+
+	// Worker A wakes up and tries to complete the refund.
+	err = repo.MarkRefundSucceeded(
+		context.Background(),
+		refund.ID,
+		workerAToken,
+		"rfnd_stale_worker_test",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf(
+			"expected ErrRefundLeaseLost for worker A, got %v",
+			err,
+		)
+	}
+
+	// Worker B must still own the refund.
+	var storedToken string
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT processing_lease_token::text
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(&storedToken)
+	if err != nil {
+		t.Fatalf("failed to read current lease token: %v", err)
+	}
+
+	if storedToken != workerBToken {
+		t.Error("worker A modified worker B's lease")
+	}
+}
+
+func TestRepositoryMarkRefundSucceededWithProviderRefundIDConflict(
+	t *testing.T,
+) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t,
+		repo,
+		pool,
+		fixture,
+	)
+
+	existingProviderRefundID := "rfnd_existing_test_001"
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider_refund_id = $2
+		WHERE id = $1
+	`,
+		refund.ID,
+		existingProviderRefundID,
+	)
+	if err != nil {
+		t.Fatalf("failed to set existing provider refund ID: %v", err)
+	}
+
+	err = repo.MarkRefundSucceeded(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"rfnd_different_test_002",
+	)
+
+	if !errors.Is(err, ErrProviderRefundIDConflict) {
+		t.Fatalf(
+			"expected ErrProviderRefundIDConflict, got %v",
+			err,
+		)
+	}
+
+	var (
+		status                 string
+		storedProviderRefundID string
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&storedProviderRefundID,
+	)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if status != RefundStatusProcessing {
+		t.Errorf("expected processing status, got %q", status)
+	}
+
+	if storedProviderRefundID != existingProviderRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %q",
+			existingProviderRefundID,
+			storedProviderRefundID,
+		)
+	}
+}
+
+func TestRepositoryRecordProviderRefundID(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	providerRefundID := "rfnd_record_test_001"
+
+	err := repo.RecordProviderRefundID(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		providerRefundID,
+	)
+	if err != nil {
+		t.Fatalf("RecordProviderRefundID() error = %v", err)
+	}
+
+	var (
+		status                   string
+		storedProviderRefundID   *string
+		processingLeaseToken     *string
+		processingLeaseExpiresAt *time.Time
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			status,
+			provider_refund_id,
+			processing_lease_token,
+			processing_lease_expires_at
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&storedProviderRefundID,
+		&processingLeaseToken,
+		&processingLeaseExpiresAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if status != RefundStatusProcessing {
+		t.Errorf("expected processing status, got %q", status)
+	}
+
+	if storedProviderRefundID == nil ||
+		*storedProviderRefundID != providerRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %v",
+			providerRefundID,
+			storedProviderRefundID,
+		)
+	}
+
+	if processingLeaseToken == nil ||
+		*processingLeaseToken != leaseToken {
+		t.Error("expected processing lease token to remain unchanged")
+	}
+
+	if processingLeaseExpiresAt == nil {
+		t.Error("expected processing lease expiration to remain set")
+	}
+}
+
+func TestRepositoryRecordProviderRefundIDWithStaleLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, workerAToken := createClaimedRefundForTest(
+		t,
+		repo,
+		pool,
+		fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at = NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire worker A lease: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("worker B failed to reclaim refund: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf(
+			"expected worker B to reclaim 1 refund, got %d",
+			len(reclaimed),
+		)
+	}
+
+	if reclaimed[0].ProcessingLeaseToken == nil {
+		t.Fatal("expected worker B lease token")
+	}
+
+	workerBToken := *reclaimed[0].ProcessingLeaseToken
+
+	if workerAToken == workerBToken {
+		t.Fatal("expected worker B to receive a different lease token")
+	}
+
+	err = repo.RecordProviderRefundID(
+		context.Background(),
+		refund.ID,
+		workerAToken,
+		"rfnd_stale_worker_test",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf(
+			"expected ErrRefundLeaseLost for worker A, got %v",
+			err,
+		)
+	}
+
+	var (
+		storedToken string
+		storedID    *string
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			processing_lease_token::text,
+			provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(&storedToken, &storedID)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if storedToken != workerBToken {
+		t.Error("worker A modified worker B's lease")
+	}
+
+	if storedID != nil {
+		t.Errorf(
+			"expected provider refund ID to remain NULL, got %q",
+			*storedID,
+		)
+	}
+}
+
+func TestRepositoryRecordProviderRefundIDIdempotent(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	providerRefundID := "rfnd_record_idempotent_001"
+
+	for i := 0; i < 2; i++ {
+		err := repo.RecordProviderRefundID(
+			context.Background(),
+			refund.ID,
+			leaseToken,
+			providerRefundID,
+		)
+		if err != nil {
+			t.Fatalf("attempt %d: RecordProviderRefundID() error = %v", i+1, err)
+		}
+	}
+
+	var storedProviderRefundID string
+
+	err := pool.QueryRow(context.Background(), `
+		SELECT provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(&storedProviderRefundID)
+	if err != nil {
+		t.Fatalf("failed to read provider refund ID: %v", err)
+	}
+
+	if storedProviderRefundID != providerRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %q",
+			providerRefundID,
+			storedProviderRefundID,
+		)
+	}
+}
+
+func TestRepositoryRecordProviderRefundIDWithConflict(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	existingProviderRefundID := "rfnd_existing_record_001"
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET provider_refund_id = $2
+		WHERE id = $1
+	`, refund.ID, existingProviderRefundID)
+	if err != nil {
+		t.Fatalf("failed to set existing provider refund ID: %v", err)
+	}
+
+	err = repo.RecordProviderRefundID(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"rfnd_different_record_002",
+	)
+
+	if !errors.Is(err, ErrProviderRefundIDConflict) {
+		t.Fatalf(
+			"expected ErrProviderRefundIDConflict, got %v",
+			err,
+		)
+	}
+
+	var storedProviderRefundID string
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT provider_refund_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(&storedProviderRefundID)
+	if err != nil {
+		t.Fatalf("failed to read provider refund ID: %v", err)
+	}
+
+	if storedProviderRefundID != existingProviderRefundID {
+		t.Errorf(
+			"expected provider refund ID %q, got %q",
+			existingProviderRefundID,
+			storedProviderRefundID,
+		)
+	}
+}
+
+func TestRepositoryRecordProviderRefundIDWithExpiredLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at = NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	err = repo.RecordProviderRefundID(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"rfnd_expired_record_001",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryMarkRefundFailed(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	failureReason := "Razorpay rejected the refund"
+
+	err := repo.MarkRefundFailed(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		failureReason,
+	)
+	if err != nil {
+		t.Fatalf("MarkRefundFailed() error = %v", err)
+	}
+
+	var (
+		status                   string
+		lastError                *string
+		processingLeaseToken     *string
+		processingLeaseExpiresAt *time.Time
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			status,
+			last_error,
+			processing_lease_token,
+			processing_lease_expires_at
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&lastError,
+		&processingLeaseToken,
+		&processingLeaseExpiresAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if status != RefundStatusFailed {
+		t.Errorf("expected failed status, got %q", status)
+	}
+
+	if lastError == nil || *lastError != failureReason {
+		t.Errorf("unexpected failure reason: %v", lastError)
+	}
+
+	if processingLeaseToken != nil {
+		t.Error("expected lease token to be cleared")
+	}
+
+	if processingLeaseExpiresAt != nil {
+		t.Error("expected lease expiration to be cleared")
+	}
+}
+
+func TestRepositoryMarkRefundReviewRequired(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	reason := "Unexpected Razorpay refund status"
+
+	err := repo.MarkRefundReviewRequired(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		reason,
+	)
+	if err != nil {
+		t.Fatalf("MarkRefundReviewRequired() error = %v", err)
+	}
+
+	var (
+		status                   string
+		lastError                *string
+		processingLeaseToken     *string
+		processingLeaseExpiresAt *time.Time
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			status,
+			last_error,
+			processing_lease_token,
+			processing_lease_expires_at
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&lastError,
+		&processingLeaseToken,
+		&processingLeaseExpiresAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if status != RefundStatusReviewRequired {
+		t.Errorf("expected review_required, got %q", status)
+	}
+
+	if lastError == nil || *lastError != reason {
+		t.Errorf("unexpected last error: %v", lastError)
+	}
+
+	if processingLeaseToken != nil {
+		t.Error("expected lease token to be cleared")
+	}
+
+	if processingLeaseExpiresAt != nil {
+		t.Error("expected lease expiration to be cleared")
+	}
+}
+
+func TestRepositoryMarkRefundReviewRequiredWithExpiredLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	err = repo.MarkRefundReviewRequired(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"Unexpected provider response",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryMarkRefundReviewRequiredWithStaleLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, workerAToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire worker A lease: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("worker B failed to reclaim refund: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected 1 reclaimed refund, got %d", len(reclaimed))
+	}
+
+	if reclaimed[0].ProcessingLeaseToken == nil {
+		t.Fatal("expected worker B lease token")
+	}
+
+	workerBToken := *reclaimed[0].ProcessingLeaseToken
+
+	err = repo.MarkRefundReviewRequired(
+		context.Background(),
+		refund.ID,
+		workerAToken,
+		"Stale worker response",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+
+	var (
+		status      string
+		storedToken string
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT status, processing_lease_token::text
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(&status, &storedToken)
+	if err != nil {
+		t.Fatalf("failed to read refund: %v", err)
+	}
+
+	if status != RefundStatusProcessing {
+		t.Errorf("expected processing status, got %q", status)
+	}
+
+	if storedToken != workerBToken {
+		t.Error("worker A modified worker B's lease")
+	}
+}
+
+func TestRepositoryMarkRefundFailedWithExpiredLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	err = repo.MarkRefundFailed(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"Provider rejected refund",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryMarkRefundFailedWithStaleLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, workerAToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire worker A lease: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("failed to reclaim refund: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected 1 reclaimed refund, got %d", len(reclaimed))
+	}
+
+	err = repo.MarkRefundFailed(
+		context.Background(),
+		refund.ID,
+		workerAToken,
+		"Stale worker failure",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryMarkRefundFailedValidation(t *testing.T) {
+	repo := &Repository{}
+
+	err := repo.MarkRefundFailed(
+		context.Background(),
+		"refund-id",
+		"lease-token",
+		"   ",
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryScheduleRefundRetry(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	nextAttemptAt := time.Now().UTC().
+		Add(10 * time.Minute).
+		Truncate(time.Microsecond)
+	failureReason := "Razorpay temporarily unavailable"
+
+	err := repo.ScheduleRefundRetry(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		failureReason,
+		nextAttemptAt,
+	)
+	if err != nil {
+		t.Fatalf("ScheduleRefundRetry() error = %v", err)
+	}
+
+	var (
+		status                   string
+		lastError                *string
+		storedNextAttemptAt      time.Time
+		processingLeaseToken     *string
+		processingLeaseExpiresAt *time.Time
+		idempotencyKey           string
+		providerPaymentID        string
+	)
+
+	err = pool.QueryRow(context.Background(), `
+		SELECT
+			status,
+			last_error,
+			next_attempt_at,
+			processing_lease_token,
+			processing_lease_expires_at,
+			idempotency_key,
+			provider_payment_id
+		FROM payment_refunds
+		WHERE id = $1
+	`, refund.ID).Scan(
+		&status,
+		&lastError,
+		&storedNextAttemptAt,
+		&processingLeaseToken,
+		&processingLeaseExpiresAt,
+		&idempotencyKey,
+		&providerPaymentID,
+	)
+	if err != nil {
+		t.Fatalf("failed to read scheduled refund: %v", err)
+	}
+
+	if status != RefundStatusPending {
+		t.Errorf("expected pending status, got %q", status)
+	}
+
+	if lastError == nil || *lastError != failureReason {
+		t.Errorf("unexpected failure reason: %v", lastError)
+	}
+
+	if !storedNextAttemptAt.Equal(nextAttemptAt) {
+		t.Errorf(
+			"expected next attempt at %v, got %v",
+			nextAttemptAt,
+			storedNextAttemptAt,
+		)
+	}
+
+	if processingLeaseToken != nil {
+		t.Error("expected processing lease token to be cleared")
+	}
+
+	if processingLeaseExpiresAt != nil {
+		t.Error("expected processing lease expiration to be cleared")
+	}
+
+	if idempotencyKey != refund.IdempotencyKey {
+		t.Error("refund idempotency key changed during retry scheduling")
+	}
+
+	if providerPaymentID != refund.ProviderPaymentID {
+		t.Error("provider payment ID changed during retry scheduling")
+	}
+}
+
+func TestRepositoryScheduleRefundRetryWithExpiredLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, leaseToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire refund lease: %v", err)
+	}
+
+	err = repo.ScheduleRefundRetry(
+		context.Background(),
+		refund.ID,
+		leaseToken,
+		"Temporary provider error",
+		time.Now().UTC().Add(10*time.Minute),
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryScheduleRefundRetryWithStaleLease(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+	fixture := createPaymentTestFixture(t, pool)
+
+	refund, workerAToken := createClaimedRefundForTest(
+		t, repo, pool, fixture,
+	)
+
+	_, err := pool.Exec(context.Background(), `
+		UPDATE payment_refunds
+		SET processing_lease_expires_at =
+			NOW() - INTERVAL '1 minute'
+		WHERE id = $1
+	`, refund.ID)
+	if err != nil {
+		t.Fatalf("failed to expire worker A lease: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimExpiredRefunds(
+		context.Background(),
+		1,
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("failed to reclaim refund: %v", err)
+	}
+
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected 1 reclaimed refund, got %d", len(reclaimed))
+	}
+
+	err = repo.ScheduleRefundRetry(
+		context.Background(),
+		refund.ID,
+		workerAToken,
+		"Stale worker retry",
+		time.Now().UTC().Add(10*time.Minute),
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+}
+
+func TestRepositoryScheduleRefundRetryValidation(t *testing.T) {
+	repo := &Repository{}
+	ctx := context.Background()
+
+	err := repo.ScheduleRefundRetry(
+		ctx,
+		"refund-id",
+		"lease-token",
+		"temporary error",
+		time.Time{},
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
+	}
+
+	err = repo.ScheduleRefundRetry(
+		ctx,
+		"refund-id",
+		"lease-token",
+		"   ",
+		time.Now().UTC().Add(time.Minute),
+	)
+
+	if !errors.Is(err, ErrRefundLeaseLost) {
+		t.Fatalf("expected ErrRefundLeaseLost, got %v", err)
 	}
 }

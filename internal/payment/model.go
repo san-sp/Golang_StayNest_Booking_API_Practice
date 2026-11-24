@@ -92,19 +92,22 @@ type WebhookEvent struct {
 
 // Refund represents a refund requested for a captured payment.
 type Refund struct {
-	ID                string
-	PaymentID         string
-	Provider          string
-	ProviderPaymentID string
-	ProviderRefundID  *string
-	IdempotencyKey    string
-	AmountPaise       int64
-	Currency          string
-	Status            string
-	AttemptCount      int
-	LastError         *string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                       string
+	PaymentID                string
+	Provider                 string
+	ProviderPaymentID        string
+	ProviderRefundID         *string
+	IdempotencyKey           string
+	AmountPaise              int64
+	Currency                 string
+	Status                   string
+	AttemptCount             int
+	LastError                *string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	ProcessingLeaseToken     *string
+	ProcessingLeaseExpiresAt *time.Time
+	NextAttemptAt            time.Time
 }
 
 // InitiateInput contains the values required to initiate payment.

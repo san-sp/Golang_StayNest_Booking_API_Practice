@@ -896,7 +896,7 @@ func (r *Repository) FulfillCapturedPayment(
 			payment.ID,
 			ProviderRazorpay,
 			input.ProviderPaymentID,
-			"refund:"+payment.ID,
+			"refund-"+payment.ID,
 			input.AmountPaise,
 			input.Currency,
 			RefundStatusPending,
@@ -1028,4 +1028,579 @@ func (r *Repository) GetByProviderOrderID(
 	}
 
 	return payment, nil
+}
+
+func (r *Repository) ClaimPendingRefunds(
+	ctx context.Context,
+	batchSize int,
+	leaseDuration time.Duration,
+) ([]Refund, error) {
+	if batchSize <= 0 {
+		return nil, ErrInvalidRefundClaimBatchSize
+	}
+
+	if leaseDuration <= 0 {
+		return nil, ErrInvalidRefundLeaseDuration
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin refund claim transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	const query = `
+		WITH candidates AS (
+			SELECT id
+			FROM payment_refunds
+			WHERE status = 'pending'
+			  AND next_attempt_at <= NOW()
+			ORDER BY next_attempt_at, created_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE payment_refunds AS refunds
+		SET
+			status = 'processing',
+			processing_lease_token = gen_random_uuid(),
+			processing_lease_expires_at =
+				NOW() + ($2 * INTERVAL '1 second'),
+			attempt_count = attempt_count + 1,
+			updated_at = NOW()
+		FROM candidates
+		WHERE refunds.id = candidates.id
+		RETURNING
+			refunds.id,
+			refunds.payment_id,
+			refunds.provider,
+			refunds.provider_payment_id,
+			refunds.provider_refund_id,
+			refunds.idempotency_key,
+			refunds.amount_paise,
+			refunds.currency,
+			refunds.status,
+			refunds.attempt_count,
+			refunds.last_error,
+			refunds.processing_lease_token,
+			refunds.processing_lease_expires_at,
+			refunds.next_attempt_at,
+			refunds.created_at,
+			refunds.updated_at
+	`
+
+	rows, err := tx.Query(
+		ctx,
+		query,
+		batchSize,
+		leaseDuration.Seconds(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim pending refunds: %w", err)
+	}
+	defer rows.Close()
+
+	refunds := make([]Refund, 0, batchSize)
+
+	for rows.Next() {
+		var refund Refund
+
+		var providerRefundID pgtype.Text
+		var lastError pgtype.Text
+
+		err := rows.Scan(
+			&refund.ID,
+			&refund.PaymentID,
+			&refund.Provider,
+			&refund.ProviderPaymentID,
+			&providerRefundID,
+			&refund.IdempotencyKey,
+			&refund.AmountPaise,
+			&refund.Currency,
+			&refund.Status,
+			&refund.AttemptCount,
+			&lastError,
+			&refund.ProcessingLeaseToken,
+			&refund.ProcessingLeaseExpiresAt,
+			&refund.NextAttemptAt,
+			&refund.CreatedAt,
+			&refund.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan claimed refund: %w", err)
+		}
+
+		if providerRefundID.Valid {
+			refund.ProviderRefundID = &providerRefundID.String
+		}
+
+		if lastError.Valid {
+			refund.LastError = &lastError.String
+		}
+
+		refunds = append(refunds, refund)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimed refunds: %w", err)
+	}
+
+	rows.Close()
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit refund claim transaction: %w", err)
+	}
+
+	return refunds, nil
+}
+
+func (r *Repository) ClaimExpiredRefunds(
+	ctx context.Context,
+	batchSize int,
+	leaseDuration time.Duration,
+) ([]Refund, error) {
+	if batchSize <= 0 {
+		return nil, ErrInvalidRefundClaimBatchSize
+	}
+
+	if leaseDuration <= 0 {
+		return nil, ErrInvalidRefundLeaseDuration
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin expired refund claim transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	const query = `
+		WITH candidates AS (
+			SELECT id
+			FROM payment_refunds
+			WHERE status = 'processing'
+			  AND processing_lease_expires_at <= NOW()
+			ORDER BY processing_lease_expires_at, created_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE payment_refunds AS refunds
+		SET
+			processing_lease_token = gen_random_uuid(),
+			processing_lease_expires_at =
+				NOW() + ($2 * INTERVAL '1 second'),
+			attempt_count = attempt_count + 1,
+			updated_at = NOW()
+		FROM candidates
+		WHERE refunds.id = candidates.id
+		RETURNING
+			refunds.id,
+			refunds.payment_id,
+			refunds.provider,
+			refunds.provider_payment_id,
+			refunds.provider_refund_id,
+			refunds.idempotency_key,
+			refunds.amount_paise,
+			refunds.currency,
+			refunds.status,
+			refunds.attempt_count,
+			refunds.last_error,
+			refunds.processing_lease_token,
+			refunds.processing_lease_expires_at,
+			refunds.next_attempt_at,
+			refunds.created_at,
+			refunds.updated_at
+	`
+
+	rows, err := tx.Query(
+		ctx,
+		query,
+		batchSize,
+		leaseDuration.Seconds(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim expired refunds: %w", err)
+	}
+	defer rows.Close()
+
+	refunds := make([]Refund, 0, batchSize)
+
+	for rows.Next() {
+		var refund Refund
+
+		var providerRefundID pgtype.Text
+		var lastError pgtype.Text
+
+		err := rows.Scan(
+			&refund.ID,
+			&refund.PaymentID,
+			&refund.Provider,
+			&refund.ProviderPaymentID,
+			&providerRefundID,
+			&refund.IdempotencyKey,
+			&refund.AmountPaise,
+			&refund.Currency,
+			&refund.Status,
+			&refund.AttemptCount,
+			&lastError,
+			&refund.ProcessingLeaseToken,
+			&refund.ProcessingLeaseExpiresAt,
+			&refund.NextAttemptAt,
+			&refund.CreatedAt,
+			&refund.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan claimed expired refund: %w", err)
+		}
+
+		if providerRefundID.Valid {
+			refund.ProviderRefundID = &providerRefundID.String
+		}
+
+		if lastError.Valid {
+			refund.LastError = &lastError.String
+		}
+
+		refunds = append(refunds, refund)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimed expired refunds: %w", err)
+	}
+
+	rows.Close()
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit expired refund claim transaction: %w", err)
+	}
+
+	return refunds, nil
+}
+
+func (r *Repository) MarkRefundSucceeded(
+	ctx context.Context,
+	refundID string,
+	leaseToken string,
+	providerRefundID string,
+) error {
+	refundID = strings.TrimSpace(refundID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	providerRefundID = strings.TrimSpace(providerRefundID)
+
+	if refundID == "" ||
+		leaseToken == "" ||
+		providerRefundID == "" {
+		return ErrRefundLeaseLost
+	}
+
+	const query = `
+		UPDATE payment_refunds
+		SET
+			status = 'succeeded',
+			provider_refund_id = COALESCE(
+				provider_refund_id,
+				$3
+			),
+			processing_lease_token = NULL,
+			processing_lease_expires_at = NULL,
+			last_error = NULL,
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND processing_lease_token = $2
+		  AND processing_lease_expires_at > NOW()
+		  AND (
+			  provider_refund_id IS NULL
+			  OR provider_refund_id = $3
+		  )
+	`
+
+	tag, err := r.pool.Exec(
+		ctx,
+		query,
+		refundID,
+		leaseToken,
+		providerRefundID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark refund succeeded: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		// Determine whether the lease is still valid but the
+		// stored provider refund ID conflicts with the response.
+		const conflictQuery = `
+			SELECT EXISTS (
+				SELECT 1
+				FROM payment_refunds
+				WHERE id = $1
+				  AND status = 'processing'
+				  AND processing_lease_token = $2
+				  AND processing_lease_expires_at > NOW()
+				  AND provider_refund_id IS NOT NULL
+				  AND provider_refund_id <> $3
+			)
+		`
+
+		var hasConflict bool
+
+		err := r.pool.QueryRow(
+			ctx,
+			conflictQuery,
+			refundID,
+			leaseToken,
+			providerRefundID,
+		).Scan(&hasConflict)
+		if err != nil {
+			return fmt.Errorf(
+				"check provider refund ID conflict: %w",
+				err,
+			)
+		}
+
+		if hasConflict {
+			return ErrProviderRefundIDConflict
+		}
+
+		return ErrRefundLeaseLost
+	}
+
+	return nil
+}
+
+func (r *Repository) RecordProviderRefundID(
+	ctx context.Context,
+	refundID string,
+	leaseToken string,
+	providerRefundID string,
+) error {
+	refundID = strings.TrimSpace(refundID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	providerRefundID = strings.TrimSpace(providerRefundID)
+
+	if refundID == "" ||
+		leaseToken == "" ||
+		providerRefundID == "" {
+		return ErrRefundLeaseLost
+	}
+
+	const query = `
+		UPDATE payment_refunds
+		SET
+			provider_refund_id = COALESCE(
+				provider_refund_id,
+				$3
+			),
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND processing_lease_token = $2
+		  AND processing_lease_expires_at > NOW()
+		  AND (
+			  provider_refund_id IS NULL
+			  OR provider_refund_id = $3
+		  )
+	`
+
+	tag, err := r.pool.Exec(
+		ctx,
+		query,
+		refundID,
+		leaseToken,
+		providerRefundID,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"record provider refund ID: %w",
+			err,
+		)
+	}
+
+	if tag.RowsAffected() == 0 {
+		const conflictQuery = `
+			SELECT EXISTS (
+				SELECT 1
+				FROM payment_refunds
+				WHERE id = $1
+				  AND status = 'processing'
+				  AND processing_lease_token = $2
+				  AND processing_lease_expires_at > NOW()
+				  AND provider_refund_id IS NOT NULL
+				  AND provider_refund_id <> $3
+			)
+		`
+
+		var hasConflict bool
+
+		err := r.pool.QueryRow(
+			ctx,
+			conflictQuery,
+			refundID,
+			leaseToken,
+			providerRefundID,
+		).Scan(&hasConflict)
+		if err != nil {
+			return fmt.Errorf(
+				"check provider refund ID conflict: %w",
+				err,
+			)
+		}
+
+		if hasConflict {
+			return ErrProviderRefundIDConflict
+		}
+
+		return ErrRefundLeaseLost
+	}
+
+	return nil
+}
+
+func (r *Repository) MarkRefundFailed(
+	ctx context.Context,
+	refundID string,
+	leaseToken string,
+	lastError string,
+) error {
+	refundID = strings.TrimSpace(refundID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	lastError = strings.TrimSpace(lastError)
+
+	if refundID == "" || leaseToken == "" || lastError == "" {
+		return ErrRefundLeaseLost
+	}
+
+	const query = `
+		UPDATE payment_refunds
+		SET
+			status = 'failed',
+			last_error = $3,
+			processing_lease_token = NULL,
+			processing_lease_expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND processing_lease_token = $2
+		  AND processing_lease_expires_at > NOW()
+	`
+
+	tag, err := r.pool.Exec(
+		ctx,
+		query,
+		refundID,
+		leaseToken,
+		lastError,
+	)
+	if err != nil {
+		return fmt.Errorf("mark refund failed: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrRefundLeaseLost
+	}
+
+	return nil
+}
+
+func (r *Repository) MarkRefundReviewRequired(
+	ctx context.Context,
+	refundID string,
+	leaseToken string,
+	lastError string,
+) error {
+	refundID = strings.TrimSpace(refundID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	lastError = strings.TrimSpace(lastError)
+
+	if refundID == "" || leaseToken == "" || lastError == "" {
+		return ErrRefundLeaseLost
+	}
+
+	const query = `
+		UPDATE payment_refunds
+		SET
+			status = 'review_required',
+			last_error = $3,
+			processing_lease_token = NULL,
+			processing_lease_expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND processing_lease_token = $2
+		  AND processing_lease_expires_at > NOW()
+	`
+
+	tag, err := r.pool.Exec(
+		ctx,
+		query,
+		refundID,
+		leaseToken,
+		lastError,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"mark refund review required: %w",
+			err,
+		)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrRefundLeaseLost
+	}
+
+	return nil
+}
+
+func (r *Repository) ScheduleRefundRetry(
+	ctx context.Context,
+	refundID string,
+	leaseToken string,
+	lastError string,
+	nextAttemptAt time.Time,
+) error {
+	refundID = strings.TrimSpace(refundID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	lastError = strings.TrimSpace(lastError)
+
+	if refundID == "" ||
+		leaseToken == "" ||
+		lastError == "" ||
+		nextAttemptAt.IsZero() {
+		return ErrRefundLeaseLost
+	}
+
+	const query = `
+		UPDATE payment_refunds
+		SET
+			status = 'pending',
+			last_error = $3,
+			next_attempt_at = $4,
+			processing_lease_token = NULL,
+			processing_lease_expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'processing'
+		  AND processing_lease_token = $2
+		  AND processing_lease_expires_at > NOW()
+	`
+
+	tag, err := r.pool.Exec(
+		ctx,
+		query,
+		refundID,
+		leaseToken,
+		lastError,
+		nextAttemptAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("schedule refund retry: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrRefundLeaseLost
+	}
+
+	return nil
 }

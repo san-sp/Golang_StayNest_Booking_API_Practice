@@ -74,4 +74,34 @@ var (
 	ErrInvalidWebhookServiceConfig = errors.New(
 		"invalid payment webhook service configuration",
 	)
+	ErrInvalidRefundClaimBatchSize = errors.New(
+		"refund claim batch size must be positive",
+	)
+
+	ErrInvalidRefundLeaseDuration = errors.New(
+		"refund lease duration must be positive",
+	)
+
+	ErrRefundLeaseLost = errors.New(
+		"refund processing lease has been lost",
+	)
+	ErrProviderRefundIDConflict = errors.New(
+		"provider refund ID conflicts with the existing refund",
+	)
+
+	ErrInvalidRefundServiceConfig = errors.New(
+		"invalid payment refund service configuration",
+	)
+
+	ErrInvalidRefundBatchSize = errors.New(
+		"refund processing batch size must be positive",
+	)
+
+	ErrInvalidRefundRetryDelay = errors.New(
+		"refund retry delay must be positive",
+	)
+
+	ErrInvalidProviderRefund = errors.New(
+		"invalid provider refund response",
+	)
 )
