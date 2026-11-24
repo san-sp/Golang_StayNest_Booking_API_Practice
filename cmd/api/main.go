@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -94,6 +95,17 @@ func run() error {
 		return fmt.Errorf("create Razorpay client: %w", err)
 	}
 
+	refundService, err := payment.NewRefundService(
+		paymentRepo,
+		razorpayClient,
+		10,
+		60*time.Second,
+		5*time.Minute,
+	)
+	if err != nil {
+		return fmt.Errorf("create refund service: %w", err)
+	}
+
 	orderService, err := payment.NewOrderService(
 		paymentRepo,
 		razorpayClient,
@@ -127,19 +139,32 @@ func run() error {
 		booking.DefaultExpiryBatchSize,
 	)
 
-	// Give the background worker its own cancellable context.
+	refundWorker := payment.NewRefundWorker(
+		refundService,
+		payment.DefaultRefundWorkerInterval,
+	)
+
+	// Give background workers a shared cancellable context.
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
-	workerDone := make(chan struct{})
+
+	var workerWG sync.WaitGroup
+
+	workerWG.Add(2)
 
 	go func() {
-		defer close(workerDone)
+		defer workerWG.Done()
 		expiryWorker.Run(workerCtx)
 	}()
 
-	// Ensure the worker stops before the database pool closes.
+	go func() {
+		defer workerWG.Done()
+		refundWorker.Run(workerCtx)
+	}()
+
+	// Ensure all background workers stop before the database pool closes.
 	defer func() {
 		cancelWorker()
-		<-workerDone
+		workerWG.Wait()
 	}()
 
 	r := router.New(
@@ -201,7 +226,7 @@ func run() error {
 
 		// Stop the background worker before shutting down the database.
 		cancelWorker()
-		<-workerDone
+		workerWG.Wait()
 
 		// Allow ongoing HTTP requests to finish.
 		shutdownCtx, cancel := context.WithTimeout(
