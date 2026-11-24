@@ -8,10 +8,13 @@ import (
 )
 
 type Config struct {
-	Environment string
-	Port        int
-	DatabaseURL string
-	JWTSecret   string
+	Environment           string
+	Port                  int
+	DatabaseURL           string
+	JWTSecret             string
+	RazorpayKeyID         string
+	RazorpayKeySecret     string
+	RazorpayWebhookSecret string
 }
 
 func getEnv(key, fallback string) string {
@@ -24,10 +27,13 @@ func getEnv(key, fallback string) string {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Environment: getEnv("APP_ENV", "development"),
-		Port:        8080,
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		JWTSecret:   os.Getenv("JWT_SECRET"),
+		Environment:           getEnv("APP_ENV", "development"),
+		Port:                  8080,
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		JWTSecret:             os.Getenv("JWT_SECRET"),
+		RazorpayKeyID:         os.Getenv("RAZORPAY_KEY_ID"),
+		RazorpayKeySecret:     os.Getenv("RAZORPAY_KEY_SECRET"),
+		RazorpayWebhookSecret: os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
 	}
 
 	portValue := os.Getenv("APP_PORT")

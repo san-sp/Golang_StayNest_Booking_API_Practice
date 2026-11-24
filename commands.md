@@ -18,3 +18,7 @@ echo "Token length: ${#TOKEN}"
 ```
 find . -name "*.go" | grep -v "_test.go" | xargs wc -l
 ```
+
+```
+openssl rand -hex 32
+```

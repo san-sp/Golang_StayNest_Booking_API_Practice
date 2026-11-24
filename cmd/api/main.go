@@ -21,6 +21,8 @@ import (
 	"staynest/internal/hotel"
 	"staynest/internal/http/router"
 	"staynest/internal/inventory"
+	"staynest/internal/payment"
+	"staynest/internal/payment/razorpay"
 	"staynest/internal/room"
 )
 
@@ -81,6 +83,65 @@ func run() error {
 	bookingRepo := booking.NewRepository(pool)
 	bookingService := booking.NewService(bookingRepo)
 
+	paymentRepo := payment.NewRepository(pool)
+
+	razorpayClient, err := razorpay.NewClient(
+		cfg.RazorpayKeyID,
+		cfg.RazorpayKeySecret,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("create Razorpay client: %w", err)
+	}
+
+	orderService, err := payment.NewOrderService(
+		paymentRepo,
+		razorpayClient,
+		cfg.RazorpayKeyID,
+	)
+	if err != nil {
+		return fmt.Errorf("create payment order service: %w", err)
+	}
+
+	paymentService, err := payment.NewService(
+		paymentRepo,
+		orderService,
+		razorpayClient,
+	)
+	if err != nil {
+		return fmt.Errorf("create payment service: %w", err)
+	}
+
+	webhookService, err := payment.NewWebhookService(
+		paymentRepo,
+		cfg.RazorpayWebhookSecret,
+	)
+	if err != nil {
+		return fmt.Errorf("create payment webhook service: %w", err)
+	}
+
+	// Initialize the booking expiry worker.
+	expiryWorker := booking.NewExpiryWorker(
+		bookingRepo,
+		booking.DefaultExpiryInterval,
+		booking.DefaultExpiryBatchSize,
+	)
+
+	// Give the background worker its own cancellable context.
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan struct{})
+
+	go func() {
+		defer close(workerDone)
+		expiryWorker.Run(workerCtx)
+	}()
+
+	// Ensure the worker stops before the database pool closes.
+	defer func() {
+		cancelWorker()
+		<-workerDone
+	}()
+
 	r := router.New(
 		pool,
 		customerService,
@@ -91,6 +152,8 @@ func run() error {
 		roomService,
 		inventoryService,
 		bookingService,
+		paymentService,
+		webhookService,
 	)
 
 	// Configure the HTTP server.
@@ -136,7 +199,11 @@ func run() error {
 	case <-ctx.Done():
 		slog.Info("shutdown signal received")
 
-		// Allow ongoing requests to finish.
+		// Stop the background worker before shutting down the database.
+		cancelWorker()
+		<-workerDone
+
+		// Allow ongoing HTTP requests to finish.
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,

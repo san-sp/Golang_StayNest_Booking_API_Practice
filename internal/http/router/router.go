@@ -17,6 +17,8 @@ func New(
 	roomService handler.RoomService,
 	inventoryService handler.InventoryService,
 	bookingService handler.BookingService,
+	paymentService handler.PaymentService,
+	webhookService handler.PaymentWebhookService,
 ) *gin.Engine {
 	r := gin.New()
 
@@ -41,6 +43,13 @@ func New(
 	// Public inventory routes.
 	r.GET("/api/v1/rooms/:id/inventory", handler.ListRoomInventory(inventoryService))
 
+	// Public Razorpay webhook route.
+	// This endpoint must not require customer authentication.
+	r.POST(
+		"/api/v1/webhooks/razorpay",
+		handler.RazorpayWebhook(webhookService),
+	)
+
 	protected := r.Group("/api/v1")
 	protected.Use(middleware.Authenticate(
 		tokenVerifier,
@@ -58,6 +67,8 @@ func New(
 	protected.POST("/bookings", handler.CreateBooking(bookingService))
 	protected.PATCH("/bookings/:id", handler.ModifyBooking(bookingService))
 	protected.DELETE("/bookings/:id", handler.CancelBooking(bookingService))
+	protected.POST("/bookings/:id/payments", handler.InitiatePayment(paymentService))
+	protected.POST("/payments/verify", handler.VerifyPayment(paymentService))
 
 	// Admin routes require authentication and administrator privileges.
 	admin := protected.Group("/admin")

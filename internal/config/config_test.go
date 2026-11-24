@@ -11,6 +11,9 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("APP_PORT", "")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("JWT_SECRET", "")
+	t.Setenv("RAZORPAY_KEY_ID", "")
+	t.Setenv("RAZORPAY_KEY_SECRET", "")
+	t.Setenv("RAZORPAY_WEBHOOK_SECRET", "")
 }
 
 func TestLoadDefaults(t *testing.T) {
@@ -111,5 +114,56 @@ func TestLoadInvalidEnvironment(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for invalid APP_ENV")
+	}
+}
+
+func TestLoadRazorpayCredentials(t *testing.T) {
+	setBaseEnv(t)
+
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/staynest")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("RAZORPAY_KEY_ID", "rzp_test_example")
+	t.Setenv("RAZORPAY_KEY_SECRET", "test-key-secret")
+	t.Setenv("RAZORPAY_WEBHOOK_SECRET", "test-webhook-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+
+	if cfg.RazorpayKeyID != "rzp_test_example" {
+		t.Errorf("unexpected Razorpay key ID: %q", cfg.RazorpayKeyID)
+	}
+
+	if cfg.RazorpayKeySecret != "test-key-secret" {
+		t.Errorf("unexpected Razorpay key secret")
+	}
+
+	if cfg.RazorpayWebhookSecret != "test-webhook-secret" {
+		t.Errorf("unexpected Razorpay webhook secret")
+	}
+}
+
+func TestLoadWithoutRazorpayCredentials(t *testing.T) {
+	setBaseEnv(t)
+
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/staynest")
+	t.Setenv("JWT_SECRET", "test-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+
+	if cfg.RazorpayKeyID != "" {
+		t.Errorf("expected empty Razorpay key ID, got %q", cfg.RazorpayKeyID)
+	}
+
+	if cfg.RazorpayKeySecret != "" {
+		t.Errorf("expected empty Razorpay key secret")
+	}
+
+	if cfg.RazorpayWebhookSecret != "" {
+		t.Errorf("expected empty Razorpay webhook secret")
 	}
 }

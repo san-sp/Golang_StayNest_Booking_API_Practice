@@ -14,6 +14,7 @@ import (
 	"staynest/internal/booking"
 	"staynest/internal/hotel"
 	"staynest/internal/inventory"
+	"staynest/internal/payment"
 	"staynest/internal/room"
 )
 
@@ -33,6 +34,44 @@ type fakeHotelService struct {
 	searchErr     error
 	searchParams  hotel.SearchParams
 	searchCalled  bool
+}
+
+type fakePaymentService struct{}
+
+type fakeWebhookService struct {
+	called    bool
+	eventID   string
+	signature string
+	body      []byte
+	err       error
+}
+
+func (f *fakeWebhookService) Process(
+	ctx context.Context,
+	eventID string,
+	signature string,
+	body []byte,
+) error {
+	f.called = true
+	f.eventID = eventID
+	f.signature = signature
+	f.body = append([]byte(nil), body...)
+
+	return f.err
+}
+
+func (f *fakePaymentService) Initiate(
+	context.Context,
+	payment.InitiateInput,
+) (*payment.CheckoutDetails, error) {
+	return nil, nil
+}
+
+func (f *fakePaymentService) Verify(
+	context.Context,
+	payment.VerifyInput,
+) (*payment.Payment, error) {
+	return nil, nil
 }
 
 func (f *fakeActiveCustomerChecker) IsActive(
@@ -179,6 +218,8 @@ func newTestRouterWithInventory(
 		roomService,
 		inventoryService,
 		bookingService,
+		&fakePaymentService{},
+		nil,
 	)
 
 	return r,
@@ -432,6 +473,8 @@ func newTestRouterWithBooking(
 		&fakeRoomService{},
 		&fakeInventoryService{},
 		bookingService,
+		&fakePaymentService{},
+		nil,
 	)
 
 	return r, tokenManager, bookingService
@@ -1104,6 +1147,110 @@ func TestCreateBookingAuthenticatedCustomer(t *testing.T) {
 		t.Errorf(
 			"expected rooms count 1, got %d",
 			bookingService.input.RoomsCount,
+		)
+	}
+}
+
+func TestInitiatePaymentRequiresAuthentication(t *testing.T) {
+	r, _, _, _, _ := newTestRouter(t, true)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/bookings/booking-123/payments",
+		nil,
+	)
+	req.Header.Set("Idempotency-Key", "payment-request-123")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d: %s",
+			http.StatusUnauthorized,
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+}
+
+func TestRazorpayWebhookIsPublic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tokenManager, err := auth.NewTokenManager(
+		"test-secret-with-at-least-32-bytes-long",
+		15*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("create token manager: %v", err)
+	}
+
+	webhookService := &fakeWebhookService{}
+
+	r := New(
+		nil,
+		nil,
+		tokenManager,
+		&fakeActiveCustomerChecker{},
+		&fakeAdminChecker{},
+		&fakeHotelService{},
+		&fakeRoomService{},
+		&fakeInventoryService{},
+		&fakeBookingService{},
+		&fakePaymentService{},
+		webhookService,
+	)
+
+	body := `{"event":"payment.captured"}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/webhooks/razorpay",
+		strings.NewReader(body),
+	)
+
+	// Deliberately do not provide an Authorization header.
+	req.Header.Set("x-razorpay-event-id", "evt_public_router_test")
+	req.Header.Set("X-Razorpay-Signature", "test-signature")
+
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d: %s",
+			http.StatusOK,
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+
+	if !webhookService.called {
+		t.Fatal("expected webhook service to be called")
+	}
+
+	if webhookService.eventID != "evt_public_router_test" {
+		t.Errorf(
+			"expected event ID %q, got %q",
+			"evt_public_router_test",
+			webhookService.eventID,
+		)
+	}
+
+	if webhookService.signature != "test-signature" {
+		t.Errorf(
+			"expected signature %q, got %q",
+			"test-signature",
+			webhookService.signature,
+		)
+	}
+
+	if string(webhookService.body) != body {
+		t.Errorf(
+			"expected body %q, got %q",
+			body,
+			string(webhookService.body),
 		)
 	}
 }

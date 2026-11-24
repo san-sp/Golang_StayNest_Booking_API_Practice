@@ -65,7 +65,7 @@ func hotelLocalToday(
 	), nil
 }
 
-// Create reserves inventory and creates a confirmed booking atomically.
+// Create reserves inventory and creates a pending-payment booking atomically.
 func (r *Repository) Create(
 	ctx context.Context,
 	booking Booking,
@@ -239,32 +239,35 @@ func (r *Repository) Create(
 		ctx,
 		`
 		INSERT INTO bookings (
-			booking_reference,
-			customer_id,
-			room_type_id,
-			check_in,
-			check_out,
-			rooms_count,
-			guests_count,
-			price_per_night_paise,
-			total_amount_paise,
-			status
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		RETURNING
-			id::text,
-			booking_reference,
-			customer_id::text,
-			room_type_id::text,
-			check_in,
-			check_out,
-			rooms_count,
-			guests_count,
-			price_per_night_paise,
-			total_amount_paise,
-			status,
-			created_at,
-			updated_at
+    booking_reference,
+    customer_id,
+    room_type_id,
+    check_in,
+    check_out,
+    rooms_count,
+    guests_count,
+    price_per_night_paise,
+    total_amount_paise,
+    status,
+    payment_expires_at
+	)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	RETURNING
+    id::text,
+    booking_reference,
+    customer_id::text,
+    room_type_id::text,
+    check_in,
+    check_out,
+    rooms_count,
+    guests_count,
+    price_per_night_paise,
+    total_amount_paise,
+    status,
+    payment_expires_at,
+    expired_at,
+    created_at,
+    updated_at
 		`,
 		booking.BookingReference,
 		booking.CustomerID,
@@ -275,7 +278,8 @@ func (r *Repository) Create(
 		booking.GuestsCount,
 		booking.PricePerNightPaise,
 		booking.TotalAmountPaise,
-		StatusConfirmed,
+		booking.Status,
+		booking.PaymentExpiresAt,
 	).Scan(
 		&created.ID,
 		&created.BookingReference,
@@ -288,6 +292,8 @@ func (r *Repository) Create(
 		&created.PricePerNightPaise,
 		&created.TotalAmountPaise,
 		&created.Status,
+		&created.PaymentExpiresAt,
+		&created.ExpiredAt,
 		&created.CreatedAt,
 		&created.UpdatedAt,
 	)
@@ -342,6 +348,8 @@ func (r *Repository) Modify(
 			price_per_night_paise,
 			total_amount_paise,
 			status,
+			payment_expires_at,
+			expired_at,
 			created_at,
 			updated_at,
 			cancelled_at
@@ -364,6 +372,8 @@ func (r *Repository) Modify(
 		&modified.PricePerNightPaise,
 		&modified.TotalAmountPaise,
 		&modified.Status,
+		&modified.PaymentExpiresAt,
+		&modified.ExpiredAt,
 		&modified.CreatedAt,
 		&modified.UpdatedAt,
 		&modified.CancelledAt,
@@ -692,6 +702,8 @@ func (r *Repository) Cancel(
             price_per_night_paise,
             total_amount_paise,
             status,
+						payment_expires_at,
+						expired_at,
             created_at,
             updated_at,
             cancelled_at
@@ -714,6 +726,8 @@ func (r *Repository) Cancel(
 		&cancelled.PricePerNightPaise,
 		&cancelled.TotalAmountPaise,
 		&cancelled.Status,
+		&cancelled.PaymentExpiresAt,
+		&cancelled.ExpiredAt,
 		&cancelled.CreatedAt,
 		&cancelled.UpdatedAt,
 		&cancelled.CancelledAt,
@@ -736,7 +750,8 @@ func (r *Repository) Cancel(
 		return cancelled, nil
 	}
 
-	if cancelled.Status != StatusConfirmed {
+	if cancelled.Status != StatusConfirmed &&
+		cancelled.Status != StatusPendingPayment {
 		return nil, fmt.Errorf(
 			"cannot cancel booking with status %q",
 			cancelled.Status,
@@ -873,6 +888,8 @@ func (r *Repository) GetByID(
             price_per_night_paise,
             total_amount_paise,
             status,
+						payment_expires_at,
+						expired_at,
             created_at,
             updated_at,
             cancelled_at
@@ -894,6 +911,8 @@ func (r *Repository) GetByID(
 		&found.PricePerNightPaise,
 		&found.TotalAmountPaise,
 		&found.Status,
+		&found.PaymentExpiresAt,
+		&found.ExpiredAt,
 		&found.CreatedAt,
 		&found.UpdatedAt,
 		&found.CancelledAt,
@@ -966,6 +985,8 @@ func (r *Repository) ListByCustomerID(
             price_per_night_paise,
             total_amount_paise,
             status,
+						payment_expires_at,
+						expired_at,
             created_at,
             updated_at,
             cancelled_at
@@ -1006,6 +1027,8 @@ func (r *Repository) ListByCustomerID(
 			&item.PricePerNightPaise,
 			&item.TotalAmountPaise,
 			&item.Status,
+			&item.PaymentExpiresAt,
+			&item.ExpiredAt,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 			&item.CancelledAt,
@@ -1067,4 +1090,242 @@ func calculateTotalAmount(
 	}
 
 	return subtotal * nights, nil
+}
+
+// ExpirePendingBookings expires overdue pending-payment bookings
+// and restores their reserved inventory atomically.
+//
+// Each booking is processed in its own transaction so that one
+// inconsistent booking does not block other expired bookings.
+func (r *Repository) ExpirePendingBookings(
+	ctx context.Context,
+	now time.Time,
+	limit int,
+) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("expiration batch limit must be positive")
+	}
+
+	expiredCount := 0
+
+	for i := 0; i < limit; i++ {
+		tx, err := r.pool.Begin(ctx)
+		if err != nil {
+			return expiredCount, fmt.Errorf(
+				"begin booking expiration transaction: %w",
+				err,
+			)
+		}
+
+		// Always attempt rollback when the transaction has not committed.
+		deferRollback := func() {
+			_ = tx.Rollback(context.Background())
+		}
+
+		var booking Booking
+
+		// Lock one overdue booking.
+		// SKIP LOCKED allows multiple workers to process different bookings.
+		err = tx.QueryRow(
+			ctx,
+			`
+			SELECT
+				id::text,
+				room_type_id::text,
+				check_in,
+				check_out,
+				rooms_count
+			FROM bookings
+			WHERE status = $1
+			  AND payment_expires_at <= $2
+			ORDER BY payment_expires_at ASC, id ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+			`,
+			StatusPendingPayment,
+			now,
+		).Scan(
+			&booking.ID,
+			&booking.RoomTypeID,
+			&booking.CheckIn,
+			&booking.CheckOut,
+			&booking.RoomsCount,
+		)
+
+		if err != nil {
+			deferRollback()
+
+			if errors.Is(err, pgx.ErrNoRows) {
+				// No more eligible bookings.
+				return expiredCount, nil
+			}
+
+			return expiredCount, fmt.Errorf(
+				"find pending booking for expiration: %w",
+				err,
+			)
+		}
+
+		nights := int64(
+			booking.CheckOut.Sub(booking.CheckIn) / (24 * time.Hour),
+		)
+
+		if nights <= 0 || booking.RoomsCount <= 0 {
+			deferRollback()
+			return expiredCount, ErrBookingInventoryInconsistent
+		}
+
+		// Lock all inventory rows in ascending date order.
+		rows, err := tx.Query(
+			ctx,
+			`
+			SELECT
+				stay_date,
+				total_rooms,
+				available_rooms
+			FROM room_inventory
+			WHERE room_type_id = $1
+			  AND stay_date >= $2
+			  AND stay_date < $3
+			ORDER BY stay_date ASC
+			FOR UPDATE
+			`,
+			booking.RoomTypeID,
+			booking.CheckIn,
+			booking.CheckOut,
+		)
+
+		if err != nil {
+			deferRollback()
+			return expiredCount, fmt.Errorf(
+				"lock inventory for expired booking: %w",
+				err,
+			)
+		}
+
+		type inventoryRow struct {
+			StayDate       time.Time
+			TotalRooms     int
+			AvailableRooms int
+		}
+
+		inventory := make([]inventoryRow, 0, int(nights))
+
+		for rows.Next() {
+			var daily inventoryRow
+
+			if err := rows.Scan(
+				&daily.StayDate,
+				&daily.TotalRooms,
+				&daily.AvailableRooms,
+			); err != nil {
+				rows.Close()
+				deferRollback()
+				return expiredCount, fmt.Errorf(
+					"scan expiration inventory: %w",
+					err,
+				)
+			}
+
+			inventory = append(inventory, daily)
+		}
+
+		rowsErr := rows.Err()
+		rows.Close()
+
+		if rowsErr != nil {
+			deferRollback()
+			return expiredCount, fmt.Errorf(
+				"iterate expiration inventory: %w",
+				rowsErr,
+			)
+		}
+
+		if int64(len(inventory)) != nights {
+			deferRollback()
+			return expiredCount, ErrBookingInventoryInconsistent
+		}
+
+		// Validate every night before modifying any inventory.
+		for _, daily := range inventory {
+			if daily.AvailableRooms < 0 ||
+				daily.AvailableRooms+booking.RoomsCount > daily.TotalRooms {
+				deferRollback()
+				return expiredCount, ErrBookingInventoryInconsistent
+			}
+		}
+
+		// Restore inventory for every night.
+		for _, daily := range inventory {
+			tag, err := tx.Exec(
+				ctx,
+				`
+				UPDATE room_inventory
+				SET available_rooms = available_rooms + $1,
+				    updated_at = $2
+				WHERE room_type_id = $3
+				  AND stay_date = $4
+				`,
+				booking.RoomsCount,
+				now,
+				booking.RoomTypeID,
+				daily.StayDate,
+			)
+
+			if err != nil {
+				deferRollback()
+				return expiredCount, fmt.Errorf(
+					"restore expired booking inventory: %w",
+					err,
+				)
+			}
+
+			if tag.RowsAffected() != 1 {
+				deferRollback()
+				return expiredCount, ErrBookingInventoryInconsistent
+			}
+		}
+
+		// Mark the booking expired in the same transaction.
+		tag, err := tx.Exec(
+			ctx,
+			`
+			UPDATE bookings
+			SET status = $1,
+			    expired_at = $2,
+			    updated_at = $2
+			WHERE id = $3
+			  AND status = $4
+			  AND payment_expires_at <= $2
+			`,
+			StatusExpired,
+			now,
+			booking.ID,
+			StatusPendingPayment,
+		)
+
+		if err != nil {
+			deferRollback()
+			return expiredCount, fmt.Errorf(
+				"mark booking as expired: %w",
+				err,
+			)
+		}
+
+		if tag.RowsAffected() != 1 {
+			deferRollback()
+			return expiredCount, ErrBookingInventoryInconsistent
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return expiredCount, fmt.Errorf(
+				"commit booking expiration: %w",
+				err,
+			)
+		}
+
+		expiredCount++
+	}
+
+	return expiredCount, nil
 }

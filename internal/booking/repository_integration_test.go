@@ -21,6 +21,43 @@ type bookingTestFixture struct {
 	roomTypeID  string
 }
 
+func lockIntegrationTestDatabase(
+	t *testing.T,
+	pool *pgxpool.Pool,
+) {
+	t.Helper()
+
+	const lockKey int64 = 2026112101
+
+	conn, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("failed to acquire integration test connection: %v", err)
+	}
+
+	_, err = conn.Exec(
+		context.Background(),
+		`SELECT pg_advisory_lock($1)`,
+		lockKey,
+	)
+	if err != nil {
+		conn.Release()
+		t.Fatalf("failed to acquire integration test lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_, err := conn.Exec(
+			context.Background(),
+			`SELECT pg_advisory_unlock($1)`,
+			lockKey,
+		)
+		if err != nil {
+			t.Errorf("failed to release integration test lock: %v", err)
+		}
+
+		conn.Release()
+	})
+}
+
 func setupBookingRepository(
 	t *testing.T,
 ) (*Repository, *pgxpool.Pool) {
@@ -45,6 +82,8 @@ func setupBookingRepository(
 	t.Cleanup(func() {
 		pool.Close()
 	})
+
+	lockIntegrationTestDatabase(t, pool)
 
 	return NewRepository(pool), pool
 }
@@ -524,6 +563,11 @@ func TestRepositoryCreateBookingSuccess(t *testing.T) {
 		fmt.Sprintf("STN-TEST-%d", time.Now().UnixNano()),
 	)
 
+	input.Status = StatusPendingPayment
+
+	paymentExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+	input.PaymentExpiresAt = &paymentExpiresAt
+
 	created, err := repo.Create(context.Background(), input)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -533,9 +577,17 @@ func TestRepositoryCreateBookingSuccess(t *testing.T) {
 		t.Error("expected booking ID to be populated")
 	}
 
-	if created.Status != StatusConfirmed {
+	if created.Status != StatusPendingPayment {
 		t.Errorf("expected status %q, got %q",
-			StatusConfirmed, created.Status)
+			StatusPendingPayment, created.Status)
+	}
+
+	if created.PaymentExpiresAt == nil {
+		t.Fatal("expected PaymentExpiresAt to be populated")
+	}
+
+	if created.ExpiredAt != nil {
+		t.Error("expected ExpiredAt to be nil for a pending booking")
 	}
 
 	if created.PricePerNightPaise != 899900 {
@@ -2015,6 +2067,280 @@ func TestRepositoryConcurrentDoubleCancel(t *testing.T) {
 				"expected 5 available rooms on %s, got %d",
 				stayDate.Format("2006-01-02"),
 				available,
+			)
+		}
+	}
+}
+
+func TestRepositoryExpirePendingBookingsRestoresInventory(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		4,
+		5,
+	)
+
+	now := time.Date(
+		2027, time.January, 10,
+		12, 0, 0, 0,
+		time.UTC,
+	)
+
+	expiresAt := now.Add(-time.Minute)
+
+	input := newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		2,
+		4,
+		fmt.Sprintf("STN-EXP-%d", time.Now().UnixNano()),
+	)
+	input.Status = StatusPendingPayment
+
+	input.PaymentExpiresAt = &expiresAt
+
+	created, err := repo.Create(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Two rooms should have been reserved for three nights.
+	for i := 0; i < 3; i++ {
+		stayDate := checkIn.AddDate(0, 0, i)
+
+		if got := getAvailableRooms(t, pool, fixture.roomTypeID, stayDate); got != 3 {
+			t.Fatalf("expected 3 available rooms before expiration, got %d", got)
+		}
+	}
+
+	expiredCount, err := repo.ExpirePendingBookings(
+		context.Background(),
+		now,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ExpirePendingBookings() error = %v", err)
+	}
+
+	if expiredCount != 1 {
+		t.Fatalf("expected 1 expired booking, got %d", expiredCount)
+	}
+
+	var status string
+	var expiredAt *time.Time
+
+	err = pool.QueryRow(
+		context.Background(),
+		`
+		SELECT status, expired_at
+		FROM bookings
+		WHERE id = $1
+		`,
+		created.ID,
+	).Scan(&status, &expiredAt)
+
+	if err != nil {
+		t.Fatalf("failed to read expired booking: %v", err)
+	}
+
+	if status != StatusExpired {
+		t.Errorf("expected status %q, got %q", StatusExpired, status)
+	}
+
+	if expiredAt == nil {
+		t.Fatal("expected expired_at to be populated")
+	}
+
+	if !expiredAt.Equal(now) {
+		t.Errorf("expected expired_at %v, got %v", now, *expiredAt)
+	}
+
+	// Inventory must be completely restored.
+	for i := 0; i < 3; i++ {
+		stayDate := checkIn.AddDate(0, 0, i)
+
+		if got := getAvailableRooms(t, pool, fixture.roomTypeID, stayDate); got != 5 {
+			t.Errorf(
+				"expected 5 available rooms after expiration on %s, got %d",
+				stayDate.Format("2006-01-02"),
+				got,
+			)
+		}
+	}
+}
+
+func TestRepositoryExpirePendingBookingsDoesNotExpireActiveBooking(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		3,
+		5,
+	)
+
+	now := time.Date(
+		2027, time.January, 10,
+		12, 0, 0, 0,
+		time.UTC,
+	)
+
+	expiresAt := now.Add(time.Minute)
+
+	input := newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		2,
+		4,
+		fmt.Sprintf("STN-ACTIVE-%d", time.Now().UnixNano()),
+	)
+
+	input.Status = StatusPendingPayment
+
+	input.PaymentExpiresAt = &expiresAt
+
+	created, err := repo.Create(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	expiredCount, err := repo.ExpirePendingBookings(
+		context.Background(),
+		now,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ExpirePendingBookings() error = %v", err)
+	}
+
+	if expiredCount != 0 {
+		t.Errorf("expected 0 expired bookings, got %d", expiredCount)
+	}
+
+	var status string
+
+	err = pool.QueryRow(
+		context.Background(),
+		`SELECT status FROM bookings WHERE id = $1`,
+		created.ID,
+	).Scan(&status)
+
+	if err != nil {
+		t.Fatalf("failed to read booking status: %v", err)
+	}
+
+	if status != StatusPendingPayment {
+		t.Errorf("expected status %q, got %q", StatusPendingPayment, status)
+	}
+
+	// Inventory must remain reserved.
+	for i := 0; i < 3; i++ {
+		stayDate := checkIn.AddDate(0, 0, i)
+
+		if got := getAvailableRooms(t, pool, fixture.roomTypeID, stayDate); got != 3 {
+			t.Errorf("expected 3 available rooms, got %d", got)
+		}
+	}
+}
+
+func TestRepositoryExpirePendingBookingsDoesNotRestoreInventoryTwice(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		3,
+		5,
+	)
+
+	now := time.Date(
+		2027, time.January, 10,
+		12, 0, 0, 0,
+		time.UTC,
+	)
+
+	expiresAt := now.Add(-time.Minute)
+
+	input := newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		2,
+		4,
+		fmt.Sprintf("STN-IDEMP-%d", time.Now().Unix()),
+	)
+
+	input.Status = StatusPendingPayment
+
+	input.PaymentExpiresAt = &expiresAt
+
+	_, err := repo.Create(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	firstCount, err := repo.ExpirePendingBookings(
+		context.Background(),
+		now,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("first expiration error = %v", err)
+	}
+
+	secondCount, err := repo.ExpirePendingBookings(
+		context.Background(),
+		now,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("second expiration error = %v", err)
+	}
+
+	if firstCount != 1 {
+		t.Errorf("expected first run to expire 1 booking, got %d", firstCount)
+	}
+
+	if secondCount != 0 {
+		t.Errorf("expected second run to expire 0 bookings, got %d", secondCount)
+	}
+
+	// Inventory must be restored exactly once.
+	for i := 0; i < 3; i++ {
+		stayDate := checkIn.AddDate(0, 0, i)
+
+		if got := getAvailableRooms(t, pool, fixture.roomTypeID, stayDate); got != 5 {
+			t.Errorf(
+				"expected 5 available rooms after repeated expiration, got %d",
+				got,
 			)
 		}
 	}
