@@ -6,4 +6,9 @@
 *.log
 tmp/
 bin/
-coverage.out
+
+# Compiled binaries
+api
+*.exe
+*.test
+*.out

@@ -43,5 +43,4 @@ services:
 
 volumes:
   staynest_postgres_data:
-    external: true
     name: golang_staynest_booking_api_staynest_postgres_data
