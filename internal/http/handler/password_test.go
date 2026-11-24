@@ -248,3 +248,82 @@ func TestChangeCustomerPasswordHandlesServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestChangeCustomerPasswordRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerPasswordChanger{}
+
+	router := gin.New()
+	router.POST(
+		"/api/v1/auth/change-password",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		ChangeCustomerPassword(service),
+	)
+
+	body := `{
+		"current_password": "OldPassword123",
+		"new_password": "NewPassword456",
+		"customer_id": "another-customer"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/change-password",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.called {
+		t.Fatal("password service must not be called")
+	}
+}
+
+func TestChangeCustomerPasswordRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerPasswordChanger{}
+
+	router := gin.New()
+	router.POST(
+		"/api/v1/auth/change-password",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		ChangeCustomerPassword(service),
+	)
+
+	body := `{"current_password":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/change-password",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.called {
+		t.Fatal("password service must not be called")
+	}
+}

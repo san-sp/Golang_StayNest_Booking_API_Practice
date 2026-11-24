@@ -1574,6 +1574,105 @@ func TestRepositoryFulfillCapturedPayment(t *testing.T) {
 	}
 }
 
+func TestRepositoryFulfillCapturedPaymentRejectsWrongCustomer(t *testing.T) {
+	repo, pool := setupPaymentRepository(t)
+
+	ownerFixture := createPaymentTestFixture(t, pool)
+	otherFixture := createPaymentTestFixture(t, pool)
+
+	testBooking, testPayment := createPaymentWithProviderOrderForTest(
+		t,
+		repo,
+		ownerFixture,
+	)
+
+	ctx := context.Background()
+
+	// Customer B attempts to fulfill Customer A's payment.
+	input := CapturedPaymentInput{
+		PaymentID:         testPayment.ID,
+		CustomerID:        otherFixture.customerID,
+		ProviderOrderID:   *testPayment.ProviderOrderID,
+		ProviderPaymentID: "pay_wrong_customer",
+		AmountPaise:       testPayment.AmountPaise,
+		Currency:          testPayment.Currency,
+	}
+
+	_, err := repo.FulfillCapturedPayment(ctx, input)
+
+	if !errors.Is(err, ErrPaymentOwnershipMismatch) {
+		t.Fatalf(
+			"expected ErrPaymentOwnershipMismatch, got %v",
+			err,
+		)
+	}
+
+	// Verify that the owner's payment remains unchanged.
+	unchangedPayment, err := repo.GetByIDForCustomer(
+		ctx,
+		testPayment.ID,
+		ownerFixture.customerID,
+	)
+	if err != nil {
+		t.Fatalf("failed to retrieve owner's payment: %v", err)
+	}
+
+	if unchangedPayment.Status != testPayment.Status {
+		t.Errorf(
+			"payment status changed: expected %q, got %q",
+			testPayment.Status,
+			unchangedPayment.Status,
+		)
+	}
+
+	if unchangedPayment.FulfillmentStatus != testPayment.FulfillmentStatus {
+		t.Errorf(
+			"fulfillment status changed: expected %q, got %q",
+			testPayment.FulfillmentStatus,
+			unchangedPayment.FulfillmentStatus,
+		)
+	}
+
+	// Verify that the booking remains unchanged.
+	var bookingStatus string
+
+	err = pool.QueryRow(ctx, `
+		SELECT status
+		FROM bookings
+		WHERE id = $1
+	`, testBooking.ID).Scan(&bookingStatus)
+	if err != nil {
+		t.Fatalf("failed to retrieve booking status: %v", err)
+	}
+
+	if bookingStatus != testBooking.Status {
+		t.Errorf(
+			"booking status changed: expected %q, got %q",
+			testBooking.Status,
+			bookingStatus,
+		)
+	}
+
+	// A rejected fulfillment must not create a payment attempt.
+	var attemptCount int
+
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM payment_attempts
+		WHERE payment_id = $1
+	`, testPayment.ID).Scan(&attemptCount)
+	if err != nil {
+		t.Fatalf("failed to count payment attempts: %v", err)
+	}
+
+	if attemptCount != 0 {
+		t.Errorf(
+			"expected 0 payment attempts, got %d",
+			attemptCount,
+		)
+	}
+}
+
 func TestRepositoryFulfillCapturedPaymentAfterCancellation(t *testing.T) {
 	repo, pool := setupPaymentRepository(t)
 	fixture := createPaymentTestFixture(t, pool)

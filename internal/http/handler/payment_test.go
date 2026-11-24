@@ -486,16 +486,8 @@ func TestVerifyPaymentRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
-func TestVerifyPaymentDoesNotTrustCustomerIDFromRequest(t *testing.T) {
-	service := &fakePaymentService{
-		verifiedPayment: &payment.Payment{
-			ID:                "payment-123",
-			BookingID:         "booking-123",
-			Status:            payment.StatusCaptured,
-			FulfillmentStatus: payment.FulfillmentFulfilled,
-		},
-	}
-
+func TestVerifyPaymentRejectsClientSuppliedCustomerID(t *testing.T) {
+	service := &fakePaymentService{}
 	r := newPaymentHandlerTestRouter(service, true)
 
 	body := `{
@@ -516,14 +508,72 @@ func TestVerifyPaymentDoesNotTrustCustomerIDFromRequest(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d: %s",
-			http.StatusOK, rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
 	}
 
-	if service.verifyInput.CustomerID != "customer-123" {
-		t.Fatalf("expected authenticated customer ID, got %q",
-			service.verifyInput.CustomerID)
+	if service.verifyCalled {
+		t.Fatal("Verify must not be called when client supplies customer ID")
+	}
+}
+
+func TestVerifyPaymentRejectsUnknownFields(t *testing.T) {
+	service := &fakePaymentService{}
+	r := newPaymentHandlerTestRouter(service, true)
+
+	body := `{
+		"payment_id": "payment-123",
+		"provider_order_id": "order_123",
+		"provider_payment_id": "pay_123",
+		"signature": "signature",
+		"unexpected_field": "unexpected-value"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/payments/verify",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.verifyCalled {
+		t.Fatal("Verify must not be called for unknown fields")
+	}
+}
+
+func TestVerifyPaymentRejectsOversizedBody(t *testing.T) {
+	service := &fakePaymentService{}
+	r := newPaymentHandlerTestRouter(service, true)
+
+	body := `{"payment_id":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/payments/verify",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.verifyCalled {
+		t.Fatal("Verify must not be called for oversized requests")
 	}
 }
 

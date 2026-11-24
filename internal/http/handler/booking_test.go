@@ -340,7 +340,6 @@ func TestCreateBookingUsesAuthenticatedCustomerID(t *testing.T) {
 		r,
 		token,
 		`{
-			"customer_id": "another-customer",
 			"room_type_id": "room-123",
 			"check_in": "2027-01-15",
 			"check_out": "2027-01-16",
@@ -814,5 +813,39 @@ func TestModifyBookingMapsDomainErrors(t *testing.T) {
 				t.Error("expected Modify service to be called")
 			}
 		})
+	}
+}
+
+func TestCreateBookingRejectsClientSuppliedCustomerID(t *testing.T) {
+	service := &fakeBookingService{}
+
+	r, tokenManager := newBookingHandlerTestRouter(t, service)
+
+	token, err := tokenManager.GenerateAccessToken("authenticated-customer")
+	if err != nil {
+		t.Fatalf("generate access token: %v", err)
+	}
+
+	rec := performBookingRequest(
+		t,
+		r,
+		token,
+		`{
+            "customer_id": "another-customer",
+            "room_type_id": "room-123",
+            "check_in": "2027-01-15",
+            "check_out": "2027-01-16",
+            "rooms_count": 1,
+            "guests_count": 2
+        }`,
+	)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.called {
+		t.Fatal("booking service must not be called")
 	}
 }

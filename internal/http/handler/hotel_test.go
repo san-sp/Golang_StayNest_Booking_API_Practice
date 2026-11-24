@@ -685,3 +685,133 @@ func TestListHotelsRejectsNonIntegerOffset(t *testing.T) {
 		t.Fatal("service should not be called for an invalid offset")
 	}
 }
+
+func TestCreateHotelRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeHotelService{}
+	router := gin.New()
+	router.POST("/admin/hotels", CreateHotel(service))
+
+	body := `{
+		"name": "StayNest Hotel",
+		"description": "Comfortable hotel",
+		"address": "123 Test Street",
+		"city": "Thiruvananthapuram",
+		"country": "India",
+		"role": "admin"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/hotels",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.createCalled {
+		t.Fatal("hotel creation service must not be called")
+	}
+}
+
+func TestCreateHotelRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeHotelService{}
+	router := gin.New()
+	router.POST("/admin/hotels", CreateHotel(service))
+
+	body := `{"name":"` + strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/hotels",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.createCalled {
+		t.Fatal("hotel creation service must not be called")
+	}
+}
+
+func TestUpdateHotelRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeHotelService{}
+	router := gin.New()
+	router.PATCH("/admin/hotels/:id", UpdateHotel(service))
+
+	body := `{
+		"name": "StayNest Hotel",
+		"description": "Comfortable hotel",
+		"address": "123 Test Street",
+		"city": "Thiruvananthapuram",
+		"country": "India",
+		"role": "admin"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/admin/hotels/hotel-123",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.updateCalled {
+		t.Fatal("hotel update service must not be called")
+	}
+}
+
+func TestUpdateHotelRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeHotelService{}
+	router := gin.New()
+	router.PATCH("/admin/hotels/:id", UpdateHotel(service))
+
+	body := `{"name":"` + strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/admin/hotels/hotel-123",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.updateCalled {
+		t.Fatal("hotel update service must not be called")
+	}
+}

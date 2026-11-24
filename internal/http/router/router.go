@@ -1,6 +1,8 @@
 package router
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 
 	"staynest/internal/http/handler"
@@ -22,6 +24,17 @@ func New(
 ) *gin.Engine {
 	r := gin.New()
 
+	loginLimiter, err := middleware.NewIPRateLimiter(10, time.Minute)
+	if err != nil {
+		panic(err)
+	}
+
+	// Do not trust client-supplied forwarded IP headers.
+	// Use the direct network peer address.
+	if err := r.SetTrustedProxies(nil); err != nil {
+		panic(err)
+	}
+
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
 
@@ -29,7 +42,7 @@ func New(
 	r.GET("/ready", handler.Ready(db))
 
 	r.POST("/api/v1/auth/register", handler.RegisterCustomer(customerService))
-	r.POST("/api/v1/auth/login", handler.LoginCustomer(customerService))
+	r.POST("/api/v1/auth/login", loginLimiter.Middleware(), handler.LoginCustomer(customerService))
 
 	// Public hotel routes.
 	r.GET("/api/v1/hotels", handler.ListHotels(hotelService))

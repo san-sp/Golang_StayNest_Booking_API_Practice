@@ -65,7 +65,16 @@ func CreateRoomType(service RoomService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req roomTypeRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})
@@ -116,7 +125,16 @@ func UpdateRoomType(service RoomService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req roomTypeRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})

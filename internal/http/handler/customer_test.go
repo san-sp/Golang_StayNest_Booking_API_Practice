@@ -200,3 +200,68 @@ func TestRegisterCustomerMapsServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestRegisterCustomerRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerRegistrar{}
+	router := gin.New()
+	router.POST("/api/v1/auth/register", RegisterCustomer(service))
+
+	body := `{
+		"name": "Alex",
+		"email": "alex@example.com",
+		"password": "Password123",
+		"role": "admin"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/register",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.gotName != "" || service.gotEmail != "" ||
+		service.gotPassword != "" {
+		t.Fatal("registration service must not be called")
+	}
+}
+
+func TestRegisterCustomerRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerRegistrar{}
+	router := gin.New()
+	router.POST("/api/v1/auth/register", RegisterCustomer(service))
+
+	body := `{"name":"` + strings.Repeat("a", maxJSONBodySize) + `"}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/register",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.gotName != "" || service.gotEmail != "" ||
+		service.gotPassword != "" {
+		t.Fatal("registration service must not be called")
+	}
+}

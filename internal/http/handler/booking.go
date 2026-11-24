@@ -113,7 +113,16 @@ func CreateBooking(service BookingService) gin.HandlerFunc {
 
 		var req createBookingRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})
@@ -214,7 +223,16 @@ func ModifyBooking(service BookingService) gin.HandlerFunc {
 
 		var req modifyBookingRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})

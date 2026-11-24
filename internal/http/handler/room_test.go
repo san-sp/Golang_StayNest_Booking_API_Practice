@@ -502,3 +502,133 @@ func TestListRoomTypesHotelNotFound(t *testing.T) {
 		t.Fatalf("expected status 404, got %d", rec.Code)
 	}
 }
+
+func TestCreateRoomTypeRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeRoomService{}
+	router := gin.New()
+	router.POST("/admin/hotels/:id/rooms", CreateRoomType(service))
+
+	body := `{
+		"name": "Deluxe Room",
+		"description": "A comfortable room",
+		"max_occupancy": 3,
+		"price_per_night_paise": 899900,
+		"hotel_id": "attacker-hotel"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/hotels/hotel-123/rooms",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.createCalled {
+		t.Fatal("Create must not be called for unknown fields")
+	}
+}
+
+func TestCreateRoomTypeRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeRoomService{}
+	router := gin.New()
+	router.POST("/admin/hotels/:id/rooms", CreateRoomType(service))
+
+	body := `{"name":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/admin/hotels/hotel-123/rooms",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.createCalled {
+		t.Fatal("Create must not be called for oversized bodies")
+	}
+}
+
+func TestUpdateRoomTypeRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeRoomService{}
+	router := gin.New()
+	router.PATCH("/admin/rooms/:id", UpdateRoomType(service))
+
+	body := `{
+		"name": "Premium Room",
+		"description": "Updated description",
+		"max_occupancy": 4,
+		"price_per_night_paise": 1099900,
+		"hotel_id": "attacker-hotel"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/admin/rooms/room-123",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.updateCalled {
+		t.Fatal("Update must not be called for unknown fields")
+	}
+}
+
+func TestUpdateRoomTypeRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeRoomService{}
+	router := gin.New()
+	router.PATCH("/admin/rooms/:id", UpdateRoomType(service))
+
+	body := `{"name":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/admin/rooms/room-123",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.updateCalled {
+		t.Fatal("Update must not be called for oversized bodies")
+	}
+}

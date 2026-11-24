@@ -229,3 +229,81 @@ func TestDeactivateCustomerHandlesServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestDeactivateCustomerRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerAccountDeactivator{}
+
+	router := gin.New()
+	router.DELETE(
+		"/api/v1/customers/me",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		DeactivateCustomer(service),
+	)
+
+	body := `{
+		"current_password": "CurrentPassword123",
+		"customer_id": "another-customer"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/api/v1/customers/me",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.called {
+		t.Fatal("deactivation service must not be called")
+	}
+}
+
+func TestDeactivateCustomerRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerAccountDeactivator{}
+
+	router := gin.New()
+	router.DELETE(
+		"/api/v1/customers/me",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		DeactivateCustomer(service),
+	)
+
+	body := `{"current_password":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/api/v1/customers/me",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.called {
+		t.Fatal("deactivation service must not be called")
+	}
+}

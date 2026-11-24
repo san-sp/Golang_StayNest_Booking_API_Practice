@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestCreateRefundSuccess(t *testing.T) {
@@ -505,4 +507,126 @@ func TestCreateRefundRejectsInvalidKeyCharacters(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertRefundRequestCancelled(
+	t *testing.T,
+	request func(context.Context, *Client) error,
+) {
+	t.Helper()
+
+	requestStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	releaseHandler := make(chan struct{})
+
+	var releaseOnce sync.Once
+
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseHandler)
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			close(requestStarted)
+
+			// Wait for either actual request cancellation
+			// or explicit test cleanup.
+			select {
+			case <-r.Context().Done():
+			case <-releaseHandler:
+			}
+
+			close(handlerDone)
+		},
+	))
+
+	defer func() {
+		release()
+		server.Close()
+	}()
+
+	client, err := newClient(
+		"test-key-id",
+		"test-secret",
+		server.URL,
+		server.Client(),
+	)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+
+	go func() {
+		result <- request(ctx, client)
+	}()
+
+	// Wait until the HTTP request reaches the server.
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP request did not reach the test server")
+	}
+
+	// Cancel the request while it is in flight.
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf(
+				"expected context.Canceled, got %v",
+				err,
+			)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP request did not stop after cancellation")
+	}
+
+	// Release the server handler so cleanup cannot hang.
+	release()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server handler did not exit")
+	}
+}
+
+func TestCreateRefundRespectsContextCancellation(t *testing.T) {
+	assertRefundRequestCancelled(
+		t,
+		func(ctx context.Context, client *Client) error {
+			_, err := client.CreateRefund(
+				ctx,
+				&CreateRefundInput{
+					PaymentID:      "pay_test123",
+					AmountPaise:    250000,
+					IdempotencyKey: "refund-test-123",
+				},
+			)
+
+			return err
+		},
+	)
+}
+
+func TestFetchRefundRespectsContextCancellation(t *testing.T) {
+	assertRefundRequestCancelled(
+		t,
+		func(ctx context.Context, client *Client) error {
+			_, err := client.FetchRefund(
+				ctx,
+				"rfnd_test123",
+			)
+
+			return err
+		},
+	)
 }

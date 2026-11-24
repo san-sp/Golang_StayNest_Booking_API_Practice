@@ -370,3 +370,81 @@ func TestUpdateCustomerProfileHandlesServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateCustomerProfileRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerProfileUpdater{}
+
+	router := gin.New()
+	router.PATCH(
+		"/api/v1/customers/me",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		UpdateCustomerProfile(service),
+	)
+
+	body := `{
+		"name": "Alex Johnson",
+		"customer_id": "attacker-customer"
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/customers/me",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.gotID != "" {
+		t.Fatal("profile service must not be called for unknown fields")
+	}
+}
+
+func TestUpdateCustomerProfileRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeCustomerProfileUpdater{}
+
+	router := gin.New()
+	router.PATCH(
+		"/api/v1/customers/me",
+		func(c *gin.Context) {
+			c.Set("customer_id", "customer-123")
+			c.Next()
+		},
+		UpdateCustomerProfile(service),
+	)
+
+	body := `{"name":"` +
+		strings.Repeat("a", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/customers/me",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.gotID != "" {
+		t.Fatal("profile service must not be called for oversized bodies")
+	}
+}

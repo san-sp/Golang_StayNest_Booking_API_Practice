@@ -148,7 +148,16 @@ func VerifyPayment(service PaymentService) gin.HandlerFunc {
 
 		var request verifyPaymentRequest
 
-		if err := c.ShouldBindJSON(&request); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &request); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid payment verification request",
 			})

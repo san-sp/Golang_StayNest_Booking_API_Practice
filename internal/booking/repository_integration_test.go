@@ -2345,3 +2345,277 @@ func TestRepositoryExpirePendingBookingsDoesNotRestoreInventoryTwice(t *testing.
 		}
 	}
 }
+
+func TestRepositoryGetBookingDifferentCustomerNotFound(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+	ctx := context.Background()
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+	anotherCustomerID := fixture.addCustomer(t)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		3,
+		5,
+	)
+
+	created, err := repo.Create(ctx, newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		2,
+		4,
+		"STN-GET-OWNER-001",
+	))
+	if err != nil {
+		t.Fatalf("create booking: %v", err)
+	}
+
+	_, err = repo.GetByID(ctx, anotherCustomerID, created.ID)
+
+	if !errors.Is(err, ErrBookingNotFound) {
+		t.Fatalf("expected ErrBookingNotFound, got %v", err)
+	}
+
+	// The owner must still be able to retrieve the booking.
+	current, err := repo.GetByID(ctx, fixture.customerIDs[0], created.ID)
+	if err != nil {
+		t.Fatalf("owner should retrieve booking: %v", err)
+	}
+
+	if current.ID != created.ID {
+		t.Errorf("expected booking ID %q, got %q", created.ID, current.ID)
+	}
+}
+
+func TestRepositoryCancelBookingDifferentCustomerNotFound(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+	ctx := context.Background()
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+	anotherCustomerID := fixture.addCustomer(t)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		3,
+		5,
+	)
+
+	created, err := repo.Create(ctx, newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		2,
+		4,
+		"STN-CANCEL-OWNER-001",
+	))
+	if err != nil {
+		t.Fatalf("create booking: %v", err)
+	}
+
+	// Capture inventory before the unauthorized cancellation.
+	availabilityBefore := make([]int, 3)
+
+	for day := 0; day < 3; day++ {
+		availabilityBefore[day] = getAvailableRooms(
+			t,
+			pool,
+			fixture.roomTypeID,
+			checkIn.AddDate(0, 0, day),
+		)
+	}
+
+	_, err = repo.Cancel(ctx, anotherCustomerID, created.ID)
+
+	if !errors.Is(err, ErrBookingNotFound) {
+		t.Fatalf("expected ErrBookingNotFound, got %v", err)
+	}
+
+	// Verify booking status and cancellation timestamp.
+	current, err := repo.GetByID(ctx, fixture.customerIDs[0], created.ID)
+	if err != nil {
+		t.Fatalf("retrieve owner's booking: %v", err)
+	}
+
+	if current.Status != StatusConfirmed {
+		t.Errorf(
+			"expected booking status %q, got %q",
+			StatusConfirmed,
+			current.Status,
+		)
+	}
+
+	if current.CancelledAt != nil {
+		t.Error("cancelled_at should remain nil")
+	}
+
+	// Inventory must remain unchanged.
+	for day := 0; day < 3; day++ {
+		availabilityAfter := getAvailableRooms(
+			t,
+			pool,
+			fixture.roomTypeID,
+			checkIn.AddDate(0, 0, day),
+		)
+
+		if availabilityAfter != availabilityBefore[day] {
+			t.Errorf(
+				"inventory changed on day %d: before %d, after %d",
+				day,
+				availabilityBefore[day],
+				availabilityAfter,
+			)
+		}
+	}
+}
+
+func TestRepositoryListByCustomerIDIsolation(t *testing.T) {
+	repo, pool := setupBookingRepository(t)
+	ctx := context.Background()
+
+	fixture := createBookingTestFixture(t, pool, 3, 899900)
+	anotherCustomerID := fixture.addCustomer(t)
+
+	checkIn := bookingTestDate(15)
+	checkOut := bookingTestDate(18)
+
+	insertBookingTestInventory(
+		t,
+		pool,
+		fixture.roomTypeID,
+		checkIn,
+		3,
+		10,
+	)
+
+	// Create two bookings for Customer A.
+	customerABooking1, err := repo.Create(ctx, newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		1,
+		2,
+		"STN-LIST-A-001",
+	))
+	if err != nil {
+		t.Fatalf("create Customer A booking 1: %v", err)
+	}
+
+	customerABooking2, err := repo.Create(ctx, newTestBooking(
+		fixture.customerIDs[0],
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		1,
+		2,
+		"STN-LIST-A-002",
+	))
+	if err != nil {
+		t.Fatalf("create Customer A booking 2: %v", err)
+	}
+
+	// Create one booking for Customer B.
+	customerBBooking, err := repo.Create(ctx, newTestBooking(
+		anotherCustomerID,
+		fixture.roomTypeID,
+		checkIn,
+		checkOut,
+		1,
+		2,
+		"STN-LIST-B-001",
+	))
+	if err != nil {
+		t.Fatalf("create Customer B booking: %v", err)
+	}
+
+	// Verify Customer A sees only their own bookings.
+	resultA, err := repo.ListByCustomerID(
+		ctx,
+		fixture.customerIDs[0],
+		ListFilter{
+			Limit:  10,
+			Offset: 0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("list Customer A bookings: %v", err)
+	}
+
+	if resultA.Total != 2 {
+		t.Fatalf("expected Customer A total 2, got %d", resultA.Total)
+	}
+
+	if len(resultA.Bookings) != 2 {
+		t.Fatalf("expected 2 Customer A bookings, got %d", len(resultA.Bookings))
+	}
+
+	customerAIDs := map[string]bool{
+		customerABooking1.ID: true,
+		customerABooking2.ID: true,
+	}
+
+	for _, item := range resultA.Bookings {
+		if item.CustomerID != fixture.customerIDs[0] {
+			t.Errorf(
+				"Customer A received booking belonging to customer %q",
+				item.CustomerID,
+			)
+		}
+
+		if !customerAIDs[item.ID] {
+			t.Errorf("Customer A received unexpected booking %q", item.ID)
+		}
+	}
+
+	// Verify Customer B sees only their own booking.
+	resultB, err := repo.ListByCustomerID(
+		ctx,
+		anotherCustomerID,
+		ListFilter{
+			Limit:  10,
+			Offset: 0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("list Customer B bookings: %v", err)
+	}
+
+	if resultB.Total != 1 {
+		t.Fatalf("expected Customer B total 1, got %d", resultB.Total)
+	}
+
+	if len(resultB.Bookings) != 1 {
+		t.Fatalf("expected 1 Customer B booking, got %d", len(resultB.Bookings))
+	}
+
+	if resultB.Bookings[0].ID != customerBBooking.ID {
+		t.Errorf(
+			"expected Customer B booking %q, got %q",
+			customerBBooking.ID,
+			resultB.Bookings[0].ID,
+		)
+	}
+
+	if resultB.Bookings[0].CustomerID != anotherCustomerID {
+		t.Errorf(
+			"expected Customer B ID %q, got %q",
+			anotherCustomerID,
+			resultB.Bookings[0].CustomerID,
+		)
+	}
+}

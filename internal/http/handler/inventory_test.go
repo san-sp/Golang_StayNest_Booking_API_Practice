@@ -117,6 +117,71 @@ func TestSetDailyInventorySuccess(t *testing.T) {
 	}
 }
 
+func TestSetDailyInventoryRejectsUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeInventoryService{}
+
+	router := gin.New()
+	router.PUT(
+		"/admin/rooms/:id/inventory/:date",
+		SetDailyInventory(service),
+	)
+
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/rooms/room-123/inventory/2026-11-15",
+		strings.NewReader(`{"total_rooms":10,"unexpected":true}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.setCalled {
+		t.Fatal("inventory service must not be called")
+	}
+}
+
+func TestSetDailyInventoryRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	service := &fakeInventoryService{}
+
+	router := gin.New()
+	router.PUT(
+		"/admin/rooms/:id/inventory/:date",
+		SetDailyInventory(service),
+	)
+
+	body := `{"total_rooms":` +
+		strings.Repeat("1", maxJSONBodySize)
+
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/rooms/room-123/inventory/2026-11-15",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	if service.setCalled {
+		t.Fatal("inventory service must not be called")
+	}
+}
+
 func TestSetDailyInventoryRejectsInvalidInput(t *testing.T) {
 	tests := []struct {
 		name       string

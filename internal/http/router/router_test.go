@@ -12,6 +12,7 @@ import (
 
 	"staynest/internal/auth"
 	"staynest/internal/booking"
+	"staynest/internal/customer"
 	"staynest/internal/hotel"
 	"staynest/internal/inventory"
 	"staynest/internal/payment"
@@ -44,6 +45,60 @@ type fakeWebhookService struct {
 	signature string
 	body      []byte
 	err       error
+}
+
+type fakeRouterCustomerService struct {
+	loginCalls int
+}
+
+func (f *fakeRouterCustomerService) Register(
+	ctx context.Context,
+	name string,
+	email string,
+	password string,
+) (*customer.Customer, error) {
+	return nil, nil
+}
+
+func (f *fakeRouterCustomerService) Login(
+	ctx context.Context,
+	email string,
+	password string,
+) (string, error) {
+	f.loginCalls++
+	return "test-access-token", nil
+}
+
+func (f *fakeRouterCustomerService) GetByID(
+	ctx context.Context,
+	id string,
+) (*customer.Customer, error) {
+	return nil, nil
+}
+
+func (f *fakeRouterCustomerService) UpdateName(
+	ctx context.Context,
+	id string,
+	name string,
+) (*customer.Customer, error) {
+	return nil, nil
+}
+
+func (f *fakeRouterCustomerService) ChangePassword(
+	ctx context.Context,
+	id string,
+	currentPassword string,
+	newPassword string,
+) error {
+	return nil
+}
+
+func (f *fakeRouterCustomerService) Deactivate(
+	ctx context.Context,
+	id string,
+	currentPassword string,
+) error {
+	return nil
 }
 
 func (f *fakeWebhookService) Process(
@@ -1251,6 +1306,131 @@ func TestRazorpayWebhookIsPublic(t *testing.T) {
 			"expected body %q, got %q",
 			body,
 			string(webhookService.body),
+		)
+	}
+}
+
+func TestLoginRouteEnforcesIPRateLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	customerService := &fakeRouterCustomerService{}
+
+	tokenManager, err := auth.NewTokenManager(
+		"test-secret-with-at-least-32-bytes-long",
+		15*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("create token manager: %v", err)
+	}
+
+	r := New(
+		nil,
+		customerService,
+		tokenManager,
+		&fakeActiveCustomerChecker{},
+		&fakeAdminChecker{},
+		&fakeHotelService{},
+		&fakeRoomService{},
+		&fakeInventoryService{},
+		&fakeBookingService{},
+		&fakePaymentService{},
+		nil,
+	)
+
+	makeLoginRequest := func(remoteAddr, forwardedFor string) *httptest.ResponseRecorder {
+		body := `{
+			"email": "alex@example.com",
+			"password": "MySecretPassword123"
+		}`
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/auth/login",
+			strings.NewReader(body),
+		)
+
+		req.RemoteAddr = remoteAddr
+		req.Header.Set("Content-Type", "application/json")
+
+		if forwardedFor != "" {
+			req.Header.Set("X-Forwarded-For", forwardedFor)
+		}
+
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		return rec
+	}
+
+	const clientOne = "192.0.2.1:1234"
+
+	// The first ten requests from one IP should reach the login handler.
+	for i := 1; i <= 10; i++ {
+		rec := makeLoginRequest(clientOne, "")
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf(
+				"request %d: expected 200, got %d: %s",
+				i,
+				rec.Code,
+				rec.Body.String(),
+			)
+		}
+	}
+
+	if customerService.loginCalls != 10 {
+		t.Fatalf(
+			"expected 10 login calls, got %d",
+			customerService.loginCalls,
+		)
+	}
+
+	// The eleventh request should be rejected.
+	rec := makeLoginRequest(clientOne, "")
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf(
+			"expected 429, got %d: %s",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header")
+	}
+
+	if customerService.loginCalls != 10 {
+		t.Fatalf(
+			"blocked request must not reach login handler; got %d calls",
+			customerService.loginCalls,
+		)
+	}
+
+	// A different IP should have an independent limit.
+	rec = makeLoginRequest("192.0.2.2:1234", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf(
+			"expected different IP to be allowed, got %d",
+			rec.Code,
+		)
+	}
+
+	// Changing X-Forwarded-For must not bypass the original IP limit.
+	rec = makeLoginRequest(clientOne, "203.0.113.50")
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf(
+			"expected spoofed forwarded IP to be rejected, got %d",
+			rec.Code,
+		)
+	}
+
+	if customerService.loginCalls != 11 {
+		t.Fatalf(
+			"expected 11 actual login calls, got %d",
+			customerService.loginCalls,
 		)
 	}
 }

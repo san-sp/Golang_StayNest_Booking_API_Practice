@@ -50,7 +50,16 @@ func RegisterCustomer(service CustomerRegistrar) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req registerCustomerRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})
@@ -121,7 +130,16 @@ func LoginCustomer(service CustomerAuthenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req loginCustomerRequest
 
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeJSON(c.Writer, c.Request, &req); err != nil {
+			var maxBytesError *http.MaxBytesError
+
+			if errors.As(err, &maxBytesError) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+					"error": "request body too large",
+				})
+				return
+			}
+
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": "invalid request body",
 			})
